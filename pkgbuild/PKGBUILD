@@ -8,7 +8,7 @@ license=('GPL')
 url="https://github.com/biglinux/gtcrn"
 pkgdesc="GTCRN Speech Enhancement LADSPA plugin using ONNX Runtime"
 depends=('glibc' 'gcc-libs' 'onnxruntime')
-makedepends=('rust' 'cargo' 'git' 'clang' 'python-onnxruntime' 'python-onnx')
+makedepends=('rust' 'cargo' 'git' 'clang' 'python-onnxruntime' 'python-onnx' 'python-typing_extensions')
 provides=(
 	ladspa-host
 )
