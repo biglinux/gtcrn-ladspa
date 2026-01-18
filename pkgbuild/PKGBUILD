@@ -1,0 +1,47 @@
+# Maintainer: Bruno Goncalves <bigbruno@gmail.com>
+
+pkgname=gtcrn-ladspa
+pkgver=$(date +%y.%m.%d)
+pkgrel=$(date +%H%M)
+arch=('x86_64')
+license=('GPL')
+url="https://github.com/biglinux/gtcrn"
+pkgdesc="GTCRN Speech Enhancement LADSPA plugin using ONNX Runtime"
+depends=('glibc' 'gcc-libs' 'onnxruntime')
+makedepends=('rust' 'cargo' 'git' 'clang' 'python-onnxruntime' 'python-onnx')
+provides=(
+	ladspa-host
+)
+
+source=("${pkgname}::git+https://github.com/biglinux/gtcrn.git")
+md5sums=('SKIP')
+
+prepare() {
+	cd "${pkgname}/ladspa"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+
+	# Patch build.rs to use system python instead of .venv and skip existence check
+	sed -i 's|PathBuf::from(manifest_dir).join(".venv/bin/python")|PathBuf::from("python")|g' build.rs
+	sed -i 's|if !python_path.exists()|if false|g' build.rs
+}
+
+build() {
+	cd "${pkgname}/ladspa"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	export CARGO_BUILD_JOBS=$(nproc)
+
+	# Dynamic build linked against system onnxruntime
+	cargo build --release --locked --features dynamic --no-default-features
+}
+
+package() {
+	cd "${pkgname}/ladspa"
+
+	install -Dm755 "target/release/libgtcrn_ladspa_ort.so" "${pkgdir}/usr/lib/ladspa/libgtcrn_ladspa.so"
+
+	if [ -f "../LICENSE" ]; then
+		install -Dm644 "../LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	fi
+}
