@@ -13,6 +13,62 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Setup Python virtual environment for model conversion
+setup_python_venv() {
+	VENV_DIR="$SCRIPT_DIR/.venv"
+
+	# Check if venv already exists and has onnxruntime and onnx
+	if [ -f "$VENV_DIR/bin/python" ]; then
+		if "$VENV_DIR/bin/python" -c "import onnxruntime; import onnx" 2>/dev/null; then
+			echo -e "${GREEN}✓ Python venv already configured${NC}"
+			return 0
+		fi
+	fi
+
+	echo -e "${YELLOW}Setting up Python virtual environment for model conversion...${NC}"
+
+	# Check if uv is available
+	if command -v uv &>/dev/null; then
+		echo "Using uv for Python environment management..."
+
+		# Create venv with uv
+		if [ ! -d "$VENV_DIR" ]; then
+			uv venv "$VENV_DIR"
+		fi
+
+		# Install onnxruntime using uv pip
+		uv pip install --python "$VENV_DIR/bin/python" onnxruntime onnx
+
+	else
+		echo "uv not found, falling back to pip..."
+
+		# Find Python
+		PYTHON_CMD=""
+		for cmd in python3 python; do
+			if command -v "$cmd" &>/dev/null; then
+				PYTHON_CMD="$cmd"
+				break
+			fi
+		done
+
+		if [ -z "$PYTHON_CMD" ]; then
+			echo -e "${RED}Error: No Python interpreter found${NC}"
+			return 1
+		fi
+
+		# Create venv with standard python -m venv
+		if [ ! -d "$VENV_DIR" ]; then
+			"$PYTHON_CMD" -m venv "$VENV_DIR"
+		fi
+
+		# Install onnxruntime using pip
+		"$VENV_DIR/bin/pip" install --upgrade pip
+		"$VENV_DIR/bin/pip" install onnxruntime onnx
+	fi
+
+	echo -e "${GREEN}✓ Python venv setup complete${NC}"
+}
+
 print_usage() {
 	echo "Usage: $0 [dynamic|static|minimal]"
 	echo ""
@@ -37,6 +93,9 @@ build_dynamic() {
 	echo "Requires 'onnxruntime' installed on the system."
 	echo ""
 
+	# Setup Python venv for model conversion
+	setup_python_venv
+
 	CARGO_BUILD_JOBS=$(nproc)
 	export CARGO_BUILD_JOBS
 	cargo build --release --features dynamic --no-default-features
@@ -55,6 +114,9 @@ build_static() {
 	echo -e "${YELLOW}Building STATIC (Microsoft Downloaded)...${NC}"
 	echo "Downloading/Using prebuilt ONNX Runtime from Microsoft."
 	echo ""
+
+	# Setup Python venv for model conversion
+	setup_python_venv
 
 	CARGO_BUILD_JOBS=$(nproc)
 	export CARGO_BUILD_JOBS
@@ -75,6 +137,9 @@ build_static() {
 build_minimal() {
 	echo -e "${YELLOW}Building MINIMAL (Docker)...${NC}"
 	echo "Linking statically against minimal runtime from Docker."
+
+	# Setup Python venv for model conversion
+	setup_python_venv
 
 	if [ ! -d "onnxruntime-minimal/lib" ]; then
 		echo -e "${RED}Error: onnxruntime-minimal/lib not found.${NC}"
