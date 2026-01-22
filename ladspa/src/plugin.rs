@@ -40,9 +40,6 @@ use std::time::Duration;
 /// Sample rate expected by the GTCRN model
 const MODEL_SAMPLE_RATE: usize = 16_000;
 
-/// Output gain to compensate for model's natural volume reduction
-const OUTPUT_GAIN: f32 = 1.45;
-
 /// Minimum sleep duration for worker thread polling (microseconds)
 const WORKER_SLEEP_MIN_US: u64 = 500;
 
@@ -207,7 +204,7 @@ fn worker_thread(
     let mut upsample_in = vec![vec![0.0_f32; HOP_SIZE + 64]];
     let mut upsample_out = vec![vec![0.0_f32; host_chunk_size + 64]];
 
-    // Output accumulator for upsampled data
+    // Output accumulator for upsampled data (wet signal)
     let mut output_accum = vec![0.0_f32; host_chunk_size * 4];
     let mut output_accum_len: usize = 0;
 
@@ -244,6 +241,7 @@ fn worker_thread(
 
         // Read samples from ring buffer (lock-free)
         let samples_read = input_consumer.pop_slice(&mut input_buffer[..required_samples]);
+
         if samples_read < required_samples {
             // Race condition: buffer drained between check and read
             thread::sleep(Duration::from_micros(WORKER_SLEEP_MIN_US));
@@ -269,6 +267,9 @@ fn worker_thread(
             }
             continue;
         }
+
+        // Strength is applied via mask interpolation in STFT processing
+        // No dry/wet blend needed
 
         // Downsample to 16kHz if needed
         if needs_resample {
@@ -314,14 +315,30 @@ fn worker_thread(
             model_accum.copy_within(HOP_SIZE..model_accum_len, 0);
             model_accum_len -= HOP_SIZE;
 
-            // Process through STFT -> Model -> iSTFT
+            // Process through STFT -> Model -> iSTFT with strength interpolation
             let spectrum = stft.analyze(&window);
             spectrum_buffer.copy_from_slice(spectrum);
 
-            let enhanced = model
-                .process_frame(&spectrum_buffer)
-                .unwrap_or(spectrum_buffer);
-            let processed = stft.synthesize(&enhanced);
+            // Get model's enhanced mask (spectrum)
+            let enhanced_mask = model.process_frame(&spectrum_buffer).unwrap_or_else(|e| {
+                eprintln!("GTCRN model error: {}", e);
+                [(0.0, 0.0); NUM_FREQ_BINS]
+            });
+
+            // Apply strength via mask interpolation
+            // strength=0 -> identity (no change), strength=1 -> full model output
+            let mut final_spectrum = spectrum_buffer;
+            if strength > 0.0 {
+                for i in 0..NUM_FREQ_BINS {
+                    // Interpolate between identity (spectrum) and enhanced
+                    final_spectrum[i].0 =
+                        spectrum[i].0 * (1.0 - strength) + enhanced_mask[i].0 * strength;
+                    final_spectrum[i].1 =
+                        spectrum[i].1 * (1.0 - strength) + enhanced_mask[i].1 * strength;
+                }
+            }
+
+            let processed = stft.synthesize(&final_spectrum);
 
             // Upsample back to host rate if needed
             if needs_resample {
@@ -334,13 +351,11 @@ fn worker_thread(
 
                 match us.process_into_buffer(&upsample_in, &mut upsample_out, None) {
                     Ok((_, out_frames)) => {
-                        // Apply gain and add to output accumulator
-                        // Branch moved outside loop for better performance
+                        // Add processed samples to output accumulator with gain
                         let space_available = output_accum.len() - output_accum_len;
                         let to_copy = out_frames.min(space_available);
-                        let gain = OUTPUT_GAIN * strength;
                         for i in 0..to_copy {
-                            output_accum[output_accum_len + i] = upsample_out[0][i] * gain;
+                            output_accum[output_accum_len + i] = upsample_out[0][i];
                         }
                         output_accum_len += to_copy;
                     }
@@ -348,9 +363,8 @@ fn worker_thread(
                         // Fallback: simple upsampling by repetition
                         let space_available = output_accum.len() - output_accum_len;
                         let to_copy = (processed.len() * 3).min(space_available);
-                        let gain = OUTPUT_GAIN * strength;
                         for i in 0..to_copy {
-                            output_accum[output_accum_len + i] = processed[i / 3] * gain;
+                            output_accum[output_accum_len + i] = processed[i / 3];
                         }
                         output_accum_len += to_copy;
                     }
@@ -359,19 +373,20 @@ fn worker_thread(
                 // No upsampling - copy directly with gain
                 let space_available = output_accum.len() - output_accum_len;
                 let to_copy = processed.len().min(space_available);
-                let gain = OUTPUT_GAIN * strength;
                 for i in 0..to_copy {
-                    output_accum[output_accum_len + i] = processed[i] * gain;
+                    output_accum[output_accum_len + i] = processed[i];
                 }
                 output_accum_len += to_copy;
             }
         }
 
-        // Write accumulated output to ring buffer (lock-free)
+        // Write processed output to ring buffer (lock-free)
+        // Strength is already applied via mask interpolation
         if output_accum_len > 0 {
             let written = output_producer.push_slice(&output_accum[..output_accum_len]);
+
+            // Shift remaining samples
             if written < output_accum_len {
-                // Partial write - keep remaining samples
                 output_accum.copy_within(written..output_accum_len, 0);
                 output_accum_len -= written;
             } else {
@@ -493,10 +508,10 @@ impl Plugin for GtcrnPlugin {
         // Get output samples (lock-free)
         let read = self.output_consumer.pop_slice(&mut output[..sample_count]);
 
-        // Fill any remaining output with passthrough input
+        // Fill any remaining output with silence (prevent noise leakage)
         if read < sample_count {
             for i in read..sample_count {
-                output[i] = input[i] * 0.95; // Slight attenuation to indicate we're behind
+                output[i] = 0.0;
             }
         }
     }
