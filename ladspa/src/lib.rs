@@ -4,14 +4,12 @@
 //! with ONNX Runtime as the inference backend. It can use OpenVINO as execution provider
 //! for optimal CPU performance on Intel hardware.
 
+pub mod biquad;
 pub mod model;
 pub mod plugin;
 pub mod stft;
 
-use ladspa::{
-    DefaultValue, PluginDescriptor, Port, PortDescriptor, HINT_INTEGER, HINT_TOGGLED,
-    PROP_HARD_REALTIME_CAPABLE, PROP_REALTIME,
-};
+use ladspa::{ControlHint, DefaultValue, PluginDescriptor, Port, PortDescriptor, Properties};
 
 /// Unique LADSPA plugin ID\
 pub const PLUGIN_ID: u64 = 0x4F52_5443; // "ORTC" in ASCII hex
@@ -46,7 +44,7 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
     Some(PluginDescriptor {
         unique_id: PLUGIN_ID,
         label: "gtcrn_mono",
-        properties: PROP_HARD_REALTIME_CAPABLE | PROP_REALTIME,
+        properties: Properties::PROP_REALTIME,
         name: "GTCRN Speech Enhancement (ORT)",
         maker: "GTCRN Model (c) 2024 Rong Xiaobin | Ladspa plugin (c) 2026 Bruno Gonçalves",
         copyright: "MIT License",
@@ -70,7 +68,7 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
             Port {
                 name: "Enable",
                 desc: PortDescriptor::ControlInput,
-                hint: Some(HINT_TOGGLED),
+                hint: Some(ControlHint::HINT_TOGGLED),
                 default: Some(DefaultValue::Value1),
                 lower_bound: None,
                 upper_bound: None,
@@ -79,15 +77,15 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 name: "Strength",
                 desc: PortDescriptor::ControlInput,
                 hint: None,
-                default: Some(DefaultValue::High),
+                default: Some(DefaultValue::Value1),
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
             },
             Port {
-                name: "Model (0=Light 1=Full)",
+                name: "Model",
                 desc: PortDescriptor::ControlInput,
-                hint: Some(HINT_INTEGER),
-                default: Some(DefaultValue::Value1), // 1 = Full quality (default)
+                hint: Some(ControlHint::HINT_INTEGER),
+                default: Some(DefaultValue::Value0), // 0 = DNS3 (default, strongest NR)
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
             },

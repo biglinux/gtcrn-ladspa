@@ -1,485 +1,229 @@
 //! GTCRN LADSPA Plugin implementation.
 //!
-//! This module implements the LADSPA plugin interface, handling:
-//! - Audio I/O at host sample rate (typically 48kHz)
-//! - High-quality resampling to model sample rate (16kHz) using sinc interpolation
-//! - Lock-free ring buffer communication for real-time audio
-//! - Adjustable enhancement strength for blending original/processed audio
-//! - Model selection via control port
+//! Processes audio synchronously within run() for compatibility with
+//! both real-time hosts (PipeWire/PulseAudio) and offline hosts (ffmpeg).
 //!
 //! ## Architecture
 //!
+//! STFT size adapts to the host sample rate so the first 257 bins always
+//! cover 0–8 kHz (matching the 16 kHz model). No sample-rate conversion.
+//!
 //! ```text
-//! Audio Thread (real-time)          Worker Thread (non-real-time)
-//! ┌─────────────────────────┐       ┌─────────────────────────────┐
-//! │ run() callback          │       │ worker_thread()             │
-//! │   ├─ input → input_ring │──────>│   ├─ downsample 48k→16k    │
-//! │   └─ output_ring → out  │<──────│   ├─ STFT → Model → iSTFT  │
-//! └─────────────────────────┘       │   └─ upsample 16k→48k      │
-//!                                   └─────────────────────────────┘
+//! run() callback (synchronous)
+//! ┌──────────────────────────────────────────────┐
+//! │ input → STFT(N) → scale → Model → unscale   │
+//! │         → iSTFT(N) → out                     │
+//! └──────────────────────────────────────────────┘
 //! ```
 
+use crate::biquad::Biquad;
 use crate::model::{GtcrnModel, ModelType, NUM_FREQ_BINS};
-use crate::stft::{StftProcessor, HOP_SIZE, NFFT};
+use crate::stft::StftProcessor;
 use crate::{PORT_ENABLE, PORT_INPUT, PORT_MODEL, PORT_OUTPUT, PORT_STRENGTH};
 use ladspa::{Plugin, PluginDescriptor, PortConnection};
-use ringbuf::{
-    traits::{Consumer, Observer, Producer, Split},
-    HeapRb,
-};
-use rubato::{FftFixedIn, FftFixedOut, Resampler};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-/// Sample rate expected by the GTCRN model
-const MODEL_SAMPLE_RATE: usize = 16_000;
-
-/// Minimum sleep duration for worker thread polling (microseconds)
-const WORKER_SLEEP_MIN_US: u64 = 500;
-
-/// Maximum sleep duration for worker thread polling (microseconds)
-/// ~5ms matches typical audio buffer sizes
-const WORKER_SLEEP_MAX_US: u64 = 5000;
-
-/// Ring buffer capacity in samples (covers multiple audio blocks)
-/// At 48kHz with 1024 sample blocks, this covers ~170ms
-const RING_BUFFER_SIZE: usize = 8192;
-
-// =============================================================================
-// Shared State
-// =============================================================================
-
-/// Shared state between audio thread and worker thread.
-/// Uses atomic operations for lock-free communication.
-struct SharedState {
-    /// Processing enabled flag
-    enabled: AtomicBool,
-    /// Strength value as u32 bits (for atomic f32 storage)
-    strength_bits: AtomicU32,
-    /// Model type value as u32 bits
-    model_bits: AtomicU32,
-    /// Shutdown signal for clean termination
-    shutdown: AtomicBool,
-    /// Flag indicating port values have been read from first run() call
-    initialized: AtomicBool,
-}
-
-impl SharedState {
-    fn new(model_type: ModelType) -> Self {
-        Self {
-            enabled: AtomicBool::new(true),
-            strength_bits: AtomicU32::new(1.0_f32.to_bits()),
-            model_bits: AtomicU32::new((model_type as u32 as f32).to_bits()),
-            shutdown: AtomicBool::new(false),
-            initialized: AtomicBool::new(false),
-        }
-    }
-
-    #[inline]
-    fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    fn set_strength(&self, strength: f32) {
-        let clamped = strength.clamp(0.0, 1.0);
-        self.strength_bits
-            .store(clamped.to_bits(), Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn get_strength(&self) -> f32 {
-        f32::from_bits(self.strength_bits.load(Ordering::Relaxed))
-    }
-
-    #[inline]
-    fn set_model(&self, value: f32) {
-        self.model_bits.store(value.to_bits(), Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn get_model_type(&self) -> ModelType {
-        let value = f32::from_bits(self.model_bits.load(Ordering::Relaxed));
-        ModelType::from_control(value)
-    }
-
-    #[inline]
-    fn should_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    fn set_initialized(&self) {
-        self.initialized.store(true, Ordering::Release);
-    }
-}
-
-// =============================================================================
-// Worker Thread
-// =============================================================================
-
-/// Worker thread for audio processing.
-///
-/// Processes audio in a separate thread to avoid blocking the real-time
-/// audio callback. Uses pre-allocated buffers to prevent memory allocations
-/// during processing. Model is created based on the initial state value.
-fn worker_thread(
-    mut input_consumer: ringbuf::HeapCons<f32>,
-    mut output_producer: ringbuf::HeapProd<f32>,
-    state: Arc<SharedState>,
-    host_sample_rate: usize,
-) {
-    let needs_resample = host_sample_rate != MODEL_SAMPLE_RATE;
-    let resample_ratio = host_sample_rate as f64 / MODEL_SAMPLE_RATE as f64;
-
-    // Calculate chunk sizes for resampling
-    // At 48kHz host and 16kHz model, ratio is 3.0
-    // We process HOP_SIZE (256) samples at model rate per frame
-    let host_chunk_size = (HOP_SIZE as f64 * resample_ratio).ceil() as usize;
-
-    // Initialize high-quality sinc resamplers
-    let mut downsampler: Option<FftFixedIn<f32>> = if needs_resample {
-        Some(
-            FftFixedIn::new(host_sample_rate, MODEL_SAMPLE_RATE, host_chunk_size, 1, 1)
-                .expect("Failed to create downsampler"),
-        )
-    } else {
-        None
-    };
-
-    let mut upsampler: Option<FftFixedOut<f32>> = if needs_resample {
-        Some(
-            FftFixedOut::new(MODEL_SAMPLE_RATE, host_sample_rate, host_chunk_size, 1, 1)
-                .expect("Failed to create upsampler"),
-        )
-    } else {
-        None
-    };
-
-    // Initialize STFT processor
-    let mut stft = StftProcessor::new(NFFT, HOP_SIZE);
-
-    // Wait for first run() call to set port values before creating model
-    while !state.is_initialized() {
-        if state.should_shutdown() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    // Create model based on current state value (now set by run() call)
-    let initial_model_type = state.get_model_type();
-    let mut model = GtcrnModel::new(initial_model_type);
-
-    // Pre-allocated fixed-size buffers (no heap allocations during processing)
-    let mut input_buffer = vec![0.0_f32; host_chunk_size + 64];
-    let mut window = vec![0.0_f32; NFFT];
-    let mut model_accum = vec![0.0_f32; HOP_SIZE * 4]; // Accumulator for downsampled samples
-    let mut model_accum_len: usize = 0;
-
-    // Resampler I/O buffers (single channel, fixed size)
-    let mut resample_in = vec![vec![0.0_f32; host_chunk_size + 64]];
-    let mut resample_out = vec![vec![0.0_f32; HOP_SIZE + 64]];
-    let mut upsample_in = vec![vec![0.0_f32; HOP_SIZE + 64]];
-    let mut upsample_out = vec![vec![0.0_f32; host_chunk_size + 64]];
-
-    // Output accumulator for upsampled data (wet signal)
-    let mut output_accum = vec![0.0_f32; host_chunk_size * 4];
-    let mut output_accum_len: usize = 0;
-
-    // Adaptive backoff: start with minimum sleep, increase when idle
-    let mut current_sleep_us = WORKER_SLEEP_MIN_US;
-
-    // Pre-computed spectrum buffer to avoid allocation in hot path
-    let mut spectrum_buffer: [(f32, f32); NUM_FREQ_BINS] = [(0.0, 0.0); NUM_FREQ_BINS];
-
-    loop {
-        if state.should_shutdown() {
-            break;
-        }
-
-        // Calculate required samples
-        let required_samples = if needs_resample {
-            downsampler.as_ref().unwrap().input_frames_next()
-        } else {
-            HOP_SIZE
-        };
-
-        // Check available samples (lock-free)
-        let available = input_consumer.occupied_len();
-        if available < required_samples {
-            // No data available - sleep with adaptive backoff
-            thread::sleep(Duration::from_micros(current_sleep_us));
-            // Increase sleep duration for next iteration (up to max)
-            current_sleep_us = (current_sleep_us * 2).min(WORKER_SLEEP_MAX_US);
-            continue;
-        }
-
-        // Data available - reset backoff to minimum
-        current_sleep_us = WORKER_SLEEP_MIN_US;
-
-        // Read samples from ring buffer (lock-free)
-        let samples_read = input_consumer.pop_slice(&mut input_buffer[..required_samples]);
-
-        if samples_read < required_samples {
-            // Race condition: buffer drained between check and read
-            thread::sleep(Duration::from_micros(WORKER_SLEEP_MIN_US));
-            continue;
-        }
-
-        // Get control values (atomic reads)
-        let is_enabled = state.is_enabled();
-        let strength = state.get_strength();
-
-        // Update model type if changed
-        let requested_model = state.get_model_type();
-        if model.model_type() != requested_model {
-            model.set_model_type(requested_model);
-        }
-
-        // Bypass mode: pass through input directly
-        if !is_enabled {
-            // Write input directly to output (with resampling if needed to maintain sync)
-            let written = output_producer.push_slice(&input_buffer[..samples_read]);
-            if written < samples_read {
-                // Output buffer full - drop samples to prevent buildup
-            }
-            continue;
-        }
-
-        // Strength is applied via mask interpolation in STFT processing
-        // No dry/wet blend needed
-
-        // Downsample to 16kHz if needed
-        if needs_resample {
-            // Copy to resampler input buffer
-            resample_in[0][..samples_read].copy_from_slice(&input_buffer[..samples_read]);
-
-            let ds = downsampler.as_mut().unwrap();
-            let frames_needed = ds.output_frames_next();
-            resample_out[0].resize(frames_needed, 0.0);
-
-            match ds.process_into_buffer(&resample_in, &mut resample_out, None) {
-                Ok((_, out_frames)) => {
-                    // Copy to model accumulator
-                    let space_available = model_accum.len() - model_accum_len;
-                    let to_copy = out_frames.min(space_available);
-                    model_accum[model_accum_len..model_accum_len + to_copy]
-                        .copy_from_slice(&resample_out[0][..to_copy]);
-                    model_accum_len += to_copy;
-                }
-                Err(_) => {
-                    // On error, use input directly (wrong rate but prevents silence)
-                    let to_copy = samples_read.min(model_accum.len() - model_accum_len);
-                    model_accum[model_accum_len..model_accum_len + to_copy]
-                        .copy_from_slice(&input_buffer[..to_copy]);
-                    model_accum_len += to_copy;
-                }
-            }
-        } else {
-            // No resampling needed
-            let to_copy = samples_read.min(model_accum.len() - model_accum_len);
-            model_accum[model_accum_len..model_accum_len + to_copy]
-                .copy_from_slice(&input_buffer[..to_copy]);
-            model_accum_len += to_copy;
-        }
-
-        // Process complete frames through STFT -> Model -> iSTFT
-        while model_accum_len >= HOP_SIZE {
-            // Shift window and add new samples
-            window.copy_within(HOP_SIZE.., 0);
-            window[NFFT - HOP_SIZE..].copy_from_slice(&model_accum[..HOP_SIZE]);
-
-            // Remove used samples from accumulator
-            model_accum.copy_within(HOP_SIZE..model_accum_len, 0);
-            model_accum_len -= HOP_SIZE;
-
-            // Process through STFT -> Model -> iSTFT with strength interpolation
-            let spectrum = stft.analyze(&window);
-            spectrum_buffer.copy_from_slice(spectrum);
-
-            // Get model's enhanced mask (spectrum)
-            let enhanced_mask = model.process_frame(&spectrum_buffer).unwrap_or_else(|e| {
-                eprintln!("GTCRN model error: {}", e);
-                [(0.0, 0.0); NUM_FREQ_BINS]
-            });
-
-            // Apply strength via mask interpolation
-            // strength=0 -> identity (no change), strength=1 -> full model output
-            let mut final_spectrum = spectrum_buffer;
-            if strength > 0.0 {
-                for i in 0..NUM_FREQ_BINS {
-                    // Interpolate between identity (spectrum) and enhanced
-                    final_spectrum[i].0 =
-                        spectrum[i].0 * (1.0 - strength) + enhanced_mask[i].0 * strength;
-                    final_spectrum[i].1 =
-                        spectrum[i].1 * (1.0 - strength) + enhanced_mask[i].1 * strength;
-                }
-            }
-
-            let processed = stft.synthesize(&final_spectrum);
-
-            // Upsample back to host rate if needed
-            if needs_resample {
-                // Copy to upsampler input
-                upsample_in[0][..processed.len()].copy_from_slice(processed);
-
-                let us = upsampler.as_mut().unwrap();
-                let frames_needed = us.output_frames_next();
-                upsample_out[0].resize(frames_needed, 0.0);
-
-                match us.process_into_buffer(&upsample_in, &mut upsample_out, None) {
-                    Ok((_, out_frames)) => {
-                        // Add processed samples to output accumulator with gain
-                        let space_available = output_accum.len() - output_accum_len;
-                        let to_copy = out_frames.min(space_available);
-                        for i in 0..to_copy {
-                            output_accum[output_accum_len + i] = upsample_out[0][i];
-                        }
-                        output_accum_len += to_copy;
-                    }
-                    Err(_) => {
-                        // Fallback: simple upsampling by repetition
-                        let space_available = output_accum.len() - output_accum_len;
-                        let to_copy = (processed.len() * 3).min(space_available);
-                        for i in 0..to_copy {
-                            output_accum[output_accum_len + i] = processed[i / 3];
-                        }
-                        output_accum_len += to_copy;
-                    }
-                }
-            } else {
-                // No upsampling - copy directly with gain
-                let space_available = output_accum.len() - output_accum_len;
-                let to_copy = processed.len().min(space_available);
-                for i in 0..to_copy {
-                    output_accum[output_accum_len + i] = processed[i];
-                }
-                output_accum_len += to_copy;
-            }
-        }
-
-        // Write processed output to ring buffer (lock-free)
-        // Strength is already applied via mask interpolation
-        if output_accum_len > 0 {
-            let written = output_producer.push_slice(&output_accum[..output_accum_len]);
-
-            // Shift remaining samples
-            if written < output_accum_len {
-                output_accum.copy_within(written..output_accum_len, 0);
-                output_accum_len -= written;
-            } else {
-                output_accum_len = 0;
-            }
-        }
-    }
-}
+/// Highpass pre-filter cutoff frequency in Hz.
+/// Removes sub-audible content that confuses the GTCRN model.
+const HP_CUTOFF_HZ: f32 = 80.0;
 
 // =============================================================================
 // Plugin Implementation
 // =============================================================================
 
-/// GTCRN LADSPA plugin instance.
-pub struct GtcrnPlugin {
-    /// Input ring buffer producer
-    input_producer: ringbuf::HeapProd<f32>,
-    /// Output ring buffer consumer
-    output_consumer: ringbuf::HeapCons<f32>,
-    /// Worker thread handle
-    worker: Option<JoinHandle<()>>,
-    /// Shared state
-    state: Arc<SharedState>,
-    /// Host sample rate
-    #[allow(dead_code)]
-    host_sample_rate: usize,
+/// How often (in `run()` calls) to re-read the external control file.
+/// The file lives on tmpfs so reads are just page-cache lookups (~1 μs).
+const EXTERNAL_POLL_INTERVAL: u32 = 1;
+
+/// Well-known path inside `$XDG_RUNTIME_DIR` where the media player
+/// writes live control values (strength, model_type) as two little-endian
+/// f32 values (8 bytes total).
+const CONTROL_FILENAME: &str = "gtcrn-ladspa-controls";
+
+// =============================================================================
+// External Controls (shared-file mechanism)
+// =============================================================================
+
+/// Reads live control values from a small file on tmpfs, avoiding the need
+/// to recreate LADSPA instances when the user adjusts the slider.
+struct ExternalControls {
+    path: std::path::PathBuf,
+    strength: f32,
+    model_type: f32,
+    available: bool,
+    counter: u32,
 }
 
-impl GtcrnPlugin {
-    /// Creates a new plugin instance.
-    ///
-    /// Returns a boxed trait object as required by the LADSPA plugin interface.
-    #[must_use]
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(_descriptor: &PluginDescriptor, sample_rate: u64) -> Box<dyn Plugin + Send> {
-        let host_sr = sample_rate as usize;
+impl ExternalControls {
+    fn new() -> Self {
+        let path = std::env::var("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join(CONTROL_FILENAME);
 
-        // Create lock-free ring buffers
-        let input_ring = HeapRb::<f32>::new(RING_BUFFER_SIZE);
-        let output_ring = HeapRb::<f32>::new(RING_BUFFER_SIZE);
-
-        let (input_producer, input_consumer) = input_ring.split();
-        let (mut output_producer, output_consumer) = output_ring.split();
-
-        // Pre-fill output buffer for latency compensation
-        // Two hops worth at host rate for smoother startup
-        let resample_ratio = host_sr as f64 / MODEL_SAMPLE_RATE as f64;
-        let prefill_samples = ((HOP_SIZE as f64 * resample_ratio) * 2.0) as usize;
-        let zeros = vec![0.0_f32; prefill_samples];
-        output_producer.push_slice(&zeros);
-
-        // Use Simple as default - will be updated when run() is called with port values
-        let state = Arc::new(SharedState::new(ModelType::Simple));
-
-        // Spawn worker thread - model will be created inside based on state
-        let worker = {
-            let st = Arc::clone(&state);
-            Some(thread::spawn(move || {
-                worker_thread(input_consumer, output_producer, st, host_sr)
-            }))
+        let mut ctrl = Self {
+            path,
+            strength: -1.0,
+            model_type: -1.0,
+            available: false,
+            counter: EXTERNAL_POLL_INTERVAL, // trigger immediate read
         };
+        ctrl.poll();
+        ctrl
+    }
 
-        Box::new(Self {
-            input_producer,
-            output_consumer,
-            worker,
-            state,
-            host_sample_rate: host_sr,
-        })
+    /// Re-read the control file if enough calls have elapsed.
+    fn poll(&mut self) {
+        self.counter += 1;
+        if self.counter < EXTERNAL_POLL_INTERVAL {
+            return;
+        }
+        self.counter = 0;
+        if let Ok(data) = std::fs::read(&self.path) {
+            if data.len() >= 8 {
+                self.strength = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                self.model_type = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                self.available = true;
+            }
+        }
     }
 }
 
-impl Drop for GtcrnPlugin {
-    fn drop(&mut self) {
-        // Signal worker to shutdown
-        self.state.request_shutdown();
+// =============================================================================
+// Plugin
+// =============================================================================
 
-        // Wait for worker to finish
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+/// GTCRN LADSPA plugin instance.
+///
+/// All processing happens synchronously within `run()`. STFT size adapts
+/// to the host sample rate so no sample-rate conversion is needed.
+///
+/// The ONNX model is lazily initialized on first `run()` call.
+pub struct GtcrnPlugin {
+    model: Option<GtcrnModel>,
+    stft: StftProcessor,
+
+    /// Computed once from stft at init.
+    nfft: usize,
+    hop_size: usize,
+
+    /// Highpass pre-filter (removes sub-80Hz content)
+    hp_filter: Biquad,
+
+    /// Sliding analysis window (last nfft samples)
+    window: Vec<f32>,
+
+    /// Input accumulator (feeds STFT in hop_size chunks)
+    input_accum: Vec<f32>,
+    input_accum_len: usize,
+
+    /// Output accumulator (synthesised samples waiting to be sent)
+    output_accum: Vec<f32>,
+    output_accum_len: usize,
+
+    /// Spectrum scratch buffer
+    spectrum_buffer: [(f32, f32); NUM_FREQ_BINS],
+
+    /// External control file for live parameter updates
+    ext_controls: ExternalControls,
+}
+
+impl GtcrnPlugin {
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(_descriptor: &PluginDescriptor, sample_rate: u64) -> Box<dyn Plugin + Send> {
+        let stft = StftProcessor::new(sample_rate as u32);
+        let nfft = stft.nfft();
+        let hop_size = stft.hop_size();
+        let hp_filter = Biquad::highpass(HP_CUTOFF_HZ, sample_rate as f32);
+
+        Box::new(Self {
+            model: None,
+            stft,
+            nfft,
+            hop_size,
+            hp_filter,
+            window: vec![0.0; nfft],
+            input_accum: vec![0.0; hop_size * 4],
+            input_accum_len: 0,
+            output_accum: vec![0.0; hop_size * 8],
+            output_accum_len: 0,
+            spectrum_buffer: [(0.0, 0.0); NUM_FREQ_BINS],
+            ext_controls: ExternalControls::new(),
+        })
+    }
+
+    /// Process complete STFT frames: analyze → model → synthesize.
+    fn process_frames(&mut self, strength: f32) {
+        let hop = self.hop_size;
+        let max_frames = self.input_accum_len / hop;
+        self.ensure_output_accum(max_frames * hop);
+
+        while self.input_accum_len >= hop {
+            // Shift window and add new samples
+            self.window.copy_within(hop.., 0);
+            self.window[self.nfft - hop..].copy_from_slice(&self.input_accum[..hop]);
+            self.input_accum.copy_within(hop..self.input_accum_len, 0);
+            self.input_accum_len -= hop;
+
+            // STFT analysis (already scaled for model)
+            let spectrum = self.stft.analyze(&self.window);
+            self.spectrum_buffer.copy_from_slice(spectrum);
+
+            // Model inference + strength blending
+            let final_spectrum = if strength == 0.0 {
+                self.spectrum_buffer
+            } else {
+                let enhanced = self
+                    .model
+                    .as_mut()
+                    .expect("model must be initialized before processing")
+                    .process_frame(&self.spectrum_buffer)
+                    .unwrap_or_else(|e| {
+                        eprintln!("GTCRN model error: {e}");
+                        self.spectrum_buffer
+                    });
+
+                if strength < 1.0 {
+                    let mut blended = self.spectrum_buffer;
+                    for i in 0..NUM_FREQ_BINS {
+                        blended[i].0 =
+                            self.spectrum_buffer[i].0 * (1.0 - strength) + enhanced[i].0 * strength;
+                        blended[i].1 =
+                            self.spectrum_buffer[i].1 * (1.0 - strength) + enhanced[i].1 * strength;
+                    }
+                    blended
+                } else {
+                    enhanced
+                }
+            };
+
+            // iSTFT synthesis (un-scales internally)
+            let processed = self.stft.synthesize(&final_spectrum);
+            let proc_len = processed.len();
+
+            self.output_accum[self.output_accum_len..self.output_accum_len + proc_len]
+                .copy_from_slice(processed);
+            self.output_accum_len += proc_len;
+        }
+    }
+
+    #[inline]
+    fn ensure_output_accum(&mut self, extra: usize) {
+        let needed = self.output_accum_len + extra;
+        if needed > self.output_accum.len() {
+            self.output_accum.resize(needed + self.hop_size, 0.0);
         }
     }
 }
 
 impl Plugin for GtcrnPlugin {
-    fn activate(&mut self) {
-        // Note: Ring buffers are not easily cleared without recreation.
-        // The prefill ensures we start with known state.
-    }
+    fn activate(&mut self) {}
 
-    fn deactivate(&mut self) {
-        // Nothing needed - worker continues running
-    }
+    fn deactivate(&mut self) {}
 
     fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {
         let input = ports[PORT_INPUT].unwrap_audio();
@@ -488,31 +232,69 @@ impl Plugin for GtcrnPlugin {
         let strength_control = *ports[PORT_STRENGTH].unwrap_control();
         let model_control = *ports[PORT_MODEL].unwrap_control();
 
-        // Update shared state (atomic writes - no locks)
-        self.state.set_enabled(enable_control >= 0.5);
-        self.state.set_strength(strength_control);
-        self.state.set_model(model_control);
+        // Poll external control file for live parameter updates
+        self.ext_controls.poll();
 
-        // Signal that port values are now available (enables model creation in worker)
-        if !self.state.is_initialized() {
-            self.state.set_initialized();
+        // External file overrides LADSPA port values when available
+        let (strength_val, model_val) = if self.ext_controls.available {
+            (self.ext_controls.strength, self.ext_controls.model_type)
+        } else {
+            (strength_control, model_control)
+        };
+
+        // Bypass mode: pass through input directly
+        if enable_control < 0.5 || strength_val <= 0.0 {
+            output[..sample_count].copy_from_slice(&input[..sample_count]);
+            return;
         }
 
-        // Push input samples to ring buffer (lock-free)
-        let written = self.input_producer.push_slice(&input[..sample_count]);
-        if written < sample_count {
-            // Ring buffer full - discard oldest samples wouldn't help here
-            // Just proceed with partial write
-        }
-
-        // Get output samples (lock-free)
-        let read = self.output_consumer.pop_slice(&mut output[..sample_count]);
-
-        // Fill any remaining output with silence (prevent noise leakage)
-        if read < sample_count {
-            for i in read..sample_count {
-                output[i] = 0.0;
+        // Update model type if changed (or create on first call)
+        let requested = ModelType::from_control(model_val);
+        match &self.model {
+            None => {
+                self.model = Some(GtcrnModel::new(requested));
             }
+            Some(m) if m.model_type() != requested => {
+                self.model
+                    .as_mut()
+                    .expect("model must be initialized")
+                    .set_model_type(requested);
+            }
+            _ => {}
+        }
+
+        let strength = strength_val.clamp(0.0, 1.0);
+
+        // Append new input to accumulator (after HP pre-filter)
+        let needed = self.input_accum_len + sample_count;
+        if needed > self.input_accum.len() {
+            self.input_accum.resize(needed + self.hop_size, 0.0);
+        }
+        self.input_accum[self.input_accum_len..self.input_accum_len + sample_count]
+            .copy_from_slice(&input[..sample_count]);
+        // Apply highpass in-place on the newly appended samples
+        self.hp_filter.process(
+            &mut self.input_accum[self.input_accum_len..self.input_accum_len + sample_count],
+        );
+        self.input_accum_len += sample_count;
+
+        // Process pipeline: STFT → model → iSTFT
+        self.process_frames(strength);
+
+        // Copy available output to host buffer
+        let available = self.output_accum_len.min(sample_count);
+        output[..available].copy_from_slice(&self.output_accum[..available]);
+
+        // Fill remainder with silence (initial latency frames only)
+        if available < sample_count {
+            output[available..sample_count].fill(0.0);
+        }
+
+        // Shift output accumulator
+        if available > 0 {
+            self.output_accum
+                .copy_within(available..self.output_accum_len, 0);
+            self.output_accum_len -= available;
         }
     }
 }

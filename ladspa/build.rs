@@ -77,8 +77,8 @@ fn convert_models(manifest_dir: &str) {
     // Define models to process: (source_name, output_name)
     // Source path is relative to manifest_dir + ../stream/onnx_models
     let models = [
-        ("gtcrn.onnx", "gtcrn.ort"),
         ("gtcrn_simple.onnx", "gtcrn_simple.ort"),
+        ("gtcrn_vctk.onnx", "gtcrn_vctk.ort"),
     ];
 
     let stream_dir = PathBuf::from(manifest_dir)
