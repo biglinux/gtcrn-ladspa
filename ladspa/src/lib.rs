@@ -32,6 +32,19 @@ pub const PORT_STRENGTH: usize = 3;
 /// Port index for model selection control
 pub const PORT_MODEL: usize = 4;
 
+/// Port index for speech strength (dual-strength: filter intensity during detected speech)
+pub const PORT_SPEECH_STRENGTH: usize = 5;
+
+/// Port index for lookahead in milliseconds (output delay enabling pre-speech detection)
+pub const PORT_LOOKAHEAD_MS: usize = 6;
+
+/// Port index for voice enhancement level (0=off, 0.75=default, 1.0=max)
+/// Internally controls: GainComp, SpectralSmooth, HfDucking, BWE, HarmonicEnhance
+pub const PORT_VOICE_ENHANCE: usize = 7;
+
+/// Port index for model blending control (0=off, 1=dual-model VAD-switched)
+pub const PORT_MODEL_BLEND: usize = 8;
+
 /// Returns the LADSPA plugin descriptor.
 #[no_mangle]
 #[allow(unsafe_code)]
@@ -88,6 +101,38 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 default: Some(DefaultValue::Value0), // 0 = DNS3 (default, strongest NR)
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
+            },
+            Port {
+                name: "SpeechStrength",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Maximum), // 1.0 — Voice Preservation 100%
+                lower_bound: Some(0.0),
+                upper_bound: Some(1.0),
+            },
+            Port {
+                name: "LookaheadMs",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Low), // ~50 ms
+                lower_bound: Some(0.0),
+                upper_bound: Some(200.0),
+            },
+            Port {
+                name: "VoiceEnhance",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Middle), // 0.50 — best WER (v7 test)
+                lower_bound: Some(0.0),
+                upper_bound: Some(1.0),
+            },
+            Port {
+                name: "ModelBlend",
+                desc: PortDescriptor::ControlInput,
+                hint: Some(ControlHint::HINT_TOGGLED),
+                default: Some(DefaultValue::Value0), // OFF: dual-model blend introduces artifacts (v4 test)
+                lower_bound: None,
+                upper_bound: None,
             },
         ],
         new: plugin::GtcrnPlugin::new,

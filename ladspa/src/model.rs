@@ -307,3 +307,66 @@ impl GtcrnModel {
         Ok(self.state.output_buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_type_from_control_dns3() {
+        assert_eq!(ModelType::from_control(0.0), ModelType::Dns3);
+        assert_eq!(ModelType::from_control(0.49), ModelType::Dns3);
+        assert_eq!(ModelType::from_control(-1.0), ModelType::Dns3);
+    }
+
+    #[test]
+    fn model_type_from_control_vctk() {
+        assert_eq!(ModelType::from_control(0.5), ModelType::Vctk);
+        assert_eq!(ModelType::from_control(1.0), ModelType::Vctk);
+        assert_eq!(ModelType::from_control(100.0), ModelType::Vctk);
+    }
+
+    #[test]
+    fn model_type_enum_values() {
+        assert_eq!(ModelType::Dns3 as u8, 0);
+        assert_eq!(ModelType::Vctk as u8, 1);
+    }
+
+    #[test]
+    fn create_model_dns3() {
+        let model = GtcrnModel::new(ModelType::Dns3);
+        assert_eq!(model.model_type(), ModelType::Dns3);
+    }
+
+    #[test]
+    fn create_model_vctk() {
+        let model = GtcrnModel::new(ModelType::Vctk);
+        assert_eq!(model.model_type(), ModelType::Vctk);
+    }
+
+    #[test]
+    fn model_type_switch() {
+        let mut model = GtcrnModel::new(ModelType::Dns3);
+        assert_eq!(model.model_type(), ModelType::Dns3);
+        model.set_model_type(ModelType::Vctk);
+        assert_eq!(model.model_type(), ModelType::Vctk);
+    }
+
+    #[test]
+    fn process_frame_returns_correct_size() {
+        let mut model = GtcrnModel::new(ModelType::Dns3);
+        let input = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
+        let output = model.process_frame(&input).expect("inference should succeed");
+        assert_eq!(output.len(), NUM_FREQ_BINS);
+    }
+
+    #[test]
+    fn process_frame_silence_passthrough() {
+        let mut model = GtcrnModel::new(ModelType::Dns3);
+        let silence = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
+        let output = model.process_frame(&silence).expect("inference should succeed");
+        // Silence in → near-silence out (model should not hallucinate energy)
+        let energy: f32 = output.iter().map(|(re, im)| re * re + im * im).sum();
+        assert!(energy < 0.01, "silence input should produce near-silence: energy={energy}");
+    }
+}
