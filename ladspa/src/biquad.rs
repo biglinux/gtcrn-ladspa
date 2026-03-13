@@ -87,7 +87,10 @@ mod tests {
         // Check energy of last 480 samples (steady state)
         let energy: f32 = samples[4320..].iter().map(|x| x * x).sum::<f32>() / 480.0;
         // Input RMS² of sine = 0.5 — should pass through with minimal attenuation
-        assert!(energy > 0.3, "1 kHz should pass through highpass 80 Hz, energy={energy}");
+        assert!(
+            energy > 0.3,
+            "1 kHz should pass through highpass 80 Hz, energy={energy}"
+        );
     }
 
     #[test]
@@ -102,7 +105,10 @@ mod tests {
         // Check energy of last 2400 samples (steady state)
         let energy: f32 = samples[7200..].iter().map(|x| x * x).sum::<f32>() / 2400.0;
         // 20 Hz is ~2 octaves below 80 Hz cutoff → ~-12 dB for 2nd order → energy < 0.05
-        assert!(energy < 0.1, "20 Hz should be attenuated by 80 Hz highpass, energy={energy}");
+        assert!(
+            energy < 0.1,
+            "20 Hz should be attenuated by 80 Hz highpass, energy={energy}"
+        );
     }
 
     #[test]

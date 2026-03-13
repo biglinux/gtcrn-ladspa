@@ -45,6 +45,10 @@ pub const PORT_VOICE_ENHANCE: usize = 7;
 /// Port index for model blending control (0=off, 1=dual-model VAD-switched)
 pub const PORT_MODEL_BLEND: usize = 8;
 
+/// Port index for noise gate level (spectral flatness + HF click detection)
+/// 0.0 = disabled, 0.5 = default/moderate, 1.0 = aggressive
+pub const PORT_NOISE_GATE: usize = 9;
+
 /// Returns the LADSPA plugin descriptor.
 #[no_mangle]
 #[allow(unsafe_code)]
@@ -81,10 +85,10 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
             Port {
                 name: "Enable",
                 desc: PortDescriptor::ControlInput,
-                hint: Some(ControlHint::HINT_TOGGLED),
-                default: Some(DefaultValue::Value1),
-                lower_bound: None,
-                upper_bound: None,
+                hint: None, // NOT HINT_TOGGLED: PipeWire 1.6.x sets toggled defaults to 0
+                default: Some(DefaultValue::Maximum), // 1.0
+                lower_bound: Some(0.0),
+                upper_bound: Some(1.0),
             },
             Port {
                 name: "Strength",
@@ -129,10 +133,18 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
             Port {
                 name: "ModelBlend",
                 desc: PortDescriptor::ControlInput,
-                hint: Some(ControlHint::HINT_TOGGLED),
-                default: Some(DefaultValue::Value0), // OFF: dual-model blend introduces artifacts (v4 test)
-                lower_bound: None,
-                upper_bound: None,
+                hint: None, // NOT HINT_TOGGLED: PipeWire 1.6.x sets toggled defaults to 0
+                default: Some(DefaultValue::Minimum), // 0.0 — OFF: dual-model blend introduces artifacts (v4 test)
+                lower_bound: Some(0.0),
+                upper_bound: Some(1.0),
+            },
+            Port {
+                name: "NoiseGate",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Middle), // 0.5 — moderate noise gating
+                lower_bound: Some(0.0),
+                upper_bound: Some(1.0),
             },
         ],
         new: plugin::GtcrnPlugin::new,

@@ -356,7 +356,9 @@ mod tests {
     fn process_frame_returns_correct_size() {
         let mut model = GtcrnModel::new(ModelType::Dns3);
         let input = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
-        let output = model.process_frame(&input).expect("inference should succeed");
+        let output = model
+            .process_frame(&input)
+            .expect("inference should succeed");
         assert_eq!(output.len(), NUM_FREQ_BINS);
     }
 
@@ -364,9 +366,14 @@ mod tests {
     fn process_frame_silence_passthrough() {
         let mut model = GtcrnModel::new(ModelType::Dns3);
         let silence = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
-        let output = model.process_frame(&silence).expect("inference should succeed");
+        let output = model
+            .process_frame(&silence)
+            .expect("inference should succeed");
         // Silence in → near-silence out (model should not hallucinate energy)
         let energy: f32 = output.iter().map(|(re, im)| re * re + im * im).sum();
-        assert!(energy < 0.01, "silence input should produce near-silence: energy={energy}");
+        assert!(
+            energy < 0.01,
+            "silence input should produce near-silence: energy={energy}"
+        );
     }
 }

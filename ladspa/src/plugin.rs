@@ -24,8 +24,8 @@ use crate::biquad::Biquad;
 use crate::model::{GtcrnModel, ModelType, NUM_FREQ_BINS};
 use crate::stft::StftProcessor;
 use crate::{
-    PORT_ENABLE, PORT_INPUT, PORT_LOOKAHEAD_MS, PORT_MODEL, PORT_MODEL_BLEND, PORT_OUTPUT,
-    PORT_SPEECH_STRENGTH, PORT_STRENGTH, PORT_VOICE_ENHANCE,
+    PORT_ENABLE, PORT_INPUT, PORT_LOOKAHEAD_MS, PORT_MODEL, PORT_MODEL_BLEND, PORT_NOISE_GATE,
+    PORT_OUTPUT, PORT_SPEECH_STRENGTH, PORT_STRENGTH, PORT_VOICE_ENHANCE,
 };
 use ladspa::{Plugin, PluginDescriptor, PortConnection};
 
@@ -42,6 +42,9 @@ struct ProcessConfig {
     /// hf_ducking, bwe, harmonic_enhance.
     voice_enhance: f32,
     model_blend: bool,
+    /// Noise gate intensity (0.0 = off, 1.0 = aggressive).
+    /// Controls spectral flatness gate + HF click detector.
+    noise_gate: f32,
 }
 // =============================================================================
 // Constants
@@ -60,7 +63,8 @@ const VAD_DECAY_COEFF: f32 = 0.92;
 const MAX_GAIN_COMP_RATIO: f32 = 1.189;
 
 /// Maximum de-essing attenuation (linear). Limits how much sibilance is cut.
-const MAX_DEESS_REDUCTION: f32 = 0.71;
+/// 0.80 = max −1.9 dB reduction (conservative to avoid clipping fricatives).
+const MAX_DEESS_REDUCTION: f32 = 0.80;
 
 /// De-essing filter center bin (normalized to 257-bin spectrum).
 const DEESS_CENTER_BIN: f32 = 176.0;
@@ -102,6 +106,7 @@ struct ExternalControls {
     lookahead_ms: f32,
     voice_enhance: f32,
     model_blend: f32,
+    noise_gate: f32,
     available: bool,
     counter: u32,
 }
@@ -121,6 +126,7 @@ impl ExternalControls {
             lookahead_ms: -1.0,
             voice_enhance: -1.0,
             model_blend: 1.0,
+            noise_gate: -1.0,
             available: false,
             counter: EXTERNAL_POLL_INTERVAL, // trigger immediate read
         };
@@ -139,6 +145,7 @@ impl ExternalControls {
             lookahead_ms: -1.0,
             voice_enhance: -1.0,
             model_blend: 1.0,
+            noise_gate: -1.0,
             available: false,
             counter: EXTERNAL_POLL_INTERVAL,
         }
@@ -167,6 +174,10 @@ impl ExternalControls {
             if data.len() >= 24 {
                 self.voice_enhance = f32::from_le_bytes([data[16], data[17], data[18], data[19]]);
                 self.model_blend = f32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+            }
+            // Format v8: 28 bytes (7 floats) — adds noise_gate
+            if data.len() >= 28 {
+                self.noise_gate = f32::from_le_bytes([data[24], data[25], data[26], data[27]]);
             }
         }
     }
@@ -263,6 +274,12 @@ pub struct GtcrnPlugin {
 
     /// HF click detector: EMA-smoothed HF/voice energy ratio
     hf_click_ratio_ema: f32,
+
+    /// 8 kHz click suppressor: EMA-smoothed 6-8kHz/0-3kHz energy ratio
+    click_8k_ema: f32,
+
+    /// Input-based onset detector: noise floor EMA (energy of input during silence)
+    input_noise_floor: f32,
 }
 
 impl GtcrnPlugin {
@@ -299,6 +316,8 @@ impl GtcrnPlugin {
             deess_ratio_smooth: 0.0,
             spectral_flatness_ema: 0.0,
             hf_click_ratio_ema: 0.0,
+            click_8k_ema: 0.0,
+            input_noise_floor: 0.0,
         })
     }
 
@@ -455,8 +474,34 @@ impl GtcrnPlugin {
                 let frame = self.lookahead_buf.pop_front().unwrap();
                 let any_future_speech = self.lookahead_buf.iter().any(|f| f.is_speech);
 
+                // ── Input-energy onset detector ────────────────────────
+                // Compute input energy directly from the original spectrum
+                // (independent of model output). This breaks the feedback
+                // loop where model attenuation → low VAD → more suppression.
+                let input_energy: f32 = frame
+                    .original
+                    .iter()
+                    .map(|&(re, im)| re * re + im * im)
+                    .sum();
+
+                // Update noise floor during confirmed silence
+                if self.vad_gate < 0.1 && !frame.is_speech {
+                    const FLOOR_ALPHA: f32 = 0.05;
+                    if self.input_noise_floor < 1e-10 {
+                        self.input_noise_floor = input_energy;
+                    } else {
+                        self.input_noise_floor = self.input_noise_floor * (1.0 - FLOOR_ALPHA)
+                            + input_energy * FLOOR_ALPHA;
+                    }
+                }
+
+                // If input energy is significantly above noise floor,
+                // this is speech onset — force vad_gate high immediately
+                let onset_detected =
+                    self.input_noise_floor > 1e-10 && input_energy > self.input_noise_floor * 4.0;
+
                 // Update VAD gate
-                if frame.is_speech || any_future_speech {
+                if frame.is_speech || any_future_speech || onset_detected {
                     self.vad_gate = 1.0;
                 } else {
                     self.vad_gate *= VAD_DECAY_COEFF;
@@ -496,19 +541,61 @@ impl GtcrnPlugin {
                     frame.enhanced
                 };
 
+                // ── Model attenuation ratio (4-8 kHz, bins 128-256) ────
+                // Compares pure model output vs original to detect noise
+                // events the model removed. Used by synthesize() to suppress
+                // the corresponding HF band (>8 kHz).
+                let model_suppress = if cfg.noise_gate > 0.01 && cfg.voice_enhance > 0.01 {
+                    let orig_e: f32 = (128..NUM_FREQ_BINS)
+                        .map(|i| {
+                            let (re, im) = frame.original[i];
+                            re * re + im * im
+                        })
+                        .sum();
+                    let enh_e: f32 = (128..NUM_FREQ_BINS)
+                        .map(|i| {
+                            let (re, im) = chosen_enhanced[i];
+                            re * re + im * im
+                        })
+                        .sum();
+                    let keep = if orig_e > 1e-10 {
+                        (enh_e / orig_e).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    // model_suppress: 0.0 = model kept everything, 1.0 = model removed all
+                    1.0 - keep
+                } else {
+                    0.0
+                };
+
+                // ── Noise-gate adaptive strength boost ─────────────────
+                // When the model heavily attenuated the low band (indicating
+                // noise/click), boost effective_strength towards 1.0 so
+                // very little of the original noise leaks through the blend.
+                // Only active during confirmed silence (vad_gate < 0.3) to
+                // avoid suppressing the onset of the first word after a pause.
+                let blend_strength =
+                    if cfg.noise_gate > 0.01 && model_suppress > 0.2 && self.vad_gate < 0.3 {
+                        let boost = model_suppress * cfg.noise_gate;
+                        (effective_strength + (1.0 - effective_strength) * boost).min(1.0)
+                    } else {
+                        effective_strength
+                    };
+
                 // Blend original and chosen enhanced spectra
-                let mut final_spectrum = if effective_strength <= 0.0 {
+                let mut final_spectrum = if blend_strength <= 0.0 {
                     frame.original
-                } else if effective_strength >= 1.0 {
+                } else if blend_strength >= 1.0 {
                     chosen_enhanced
                 } else {
                     let mut blended = frame.original;
-                    let inv = 1.0 - effective_strength;
+                    let inv = 1.0 - blend_strength;
                     for i in 0..NUM_FREQ_BINS {
                         blended[i].0 =
-                            frame.original[i].0 * inv + chosen_enhanced[i].0 * effective_strength;
+                            frame.original[i].0 * inv + chosen_enhanced[i].0 * blend_strength;
                         blended[i].1 =
-                            frame.original[i].1 * inv + chosen_enhanced[i].1 * effective_strength;
+                            frame.original[i].1 * inv + chosen_enhanced[i].1 * blend_strength;
                     }
                     blended
                 };
@@ -516,14 +603,11 @@ impl GtcrnPlugin {
                 // ============================================================
                 // Non-vocal noise suppression (spectral flatness gate)
                 // ============================================================
-                // Human voice has strong formant peaks → low spectral flatness.
-                // Non-vocal transients (rustling, paper, candy wrappers) have
-                // a flat, noise-like spectrum → high spectral flatness.
-                // We compute flatness on the INPUT spectrum and attenuate the
-                // output when sustained high flatness is detected.
+                // Detects sustained noise-like sounds (rustling, paper).
+                // Very conservative to avoid false positives on speech
+                // sibilants (/s/, /f/, /ʃ/) which are also spectrally flat.
+                // Max attenuation limited to 30% to preserve speech quality.
                 let flatness_atten = {
-                    // Compute spectral flatness of input: geometric_mean / arithmetic_mean
-                    // of magnitude bins in vocal range (bins 3..200 ≈ 94–6250 Hz)
                     let mut log_sum = 0.0f32;
                     let mut lin_sum = 0.0f32;
                     let mut count = 0u32;
@@ -544,9 +628,10 @@ impl GtcrnPlugin {
                         0.0
                     };
 
-                    // EMA smoothing — moderate attack, fast release (sibilants recover quickly)
-                    const FLATNESS_ATTACK: f32 = 0.15;
-                    const FLATNESS_RELEASE: f32 = 0.30;
+                    // Slow EMA attack: takes ~15 frames (~240 ms) to ramp up.
+                    // Brief speech sibilants (60-100 ms) barely register.
+                    const FLATNESS_ATTACK: f32 = 0.06;
+                    const FLATNESS_RELEASE: f32 = 0.35;
                     let alpha = if flatness > self.spectral_flatness_ema {
                         FLATNESS_ATTACK
                     } else {
@@ -555,15 +640,16 @@ impl GtcrnPlugin {
                     self.spectral_flatness_ema =
                         self.spectral_flatness_ema * (1.0 - alpha) + flatness * alpha;
 
-                    // Compute attenuation factor when sustained flatness exceeds voice range
-                    // Voice: flatness 0.05–0.30 | Noise/transients: 0.55+
-                    const FLATNESS_THRESHOLD: f32 = 0.45;
-                    const FLATNESS_CEILING: f32 = 0.70;
+                    // High threshold + low max attenuation = very conservative.
+                    // Only sustained noise (>300 ms of flatness > 0.55) gets attenuated.
+                    const FLATNESS_THRESHOLD: f32 = 0.55;
+                    const FLATNESS_CEILING: f32 = 0.80;
                     if self.spectral_flatness_ema > FLATNESS_THRESHOLD {
                         let t = ((self.spectral_flatness_ema - FLATNESS_THRESHOLD)
                             / (FLATNESS_CEILING - FLATNESS_THRESHOLD))
                             .clamp(0.0, 1.0);
-                        1.0 - t * t * 0.99
+                        // Max 30% attenuation (was 99%)
+                        1.0 - t * t * 0.30
                     } else {
                         1.0
                     }
@@ -572,22 +658,16 @@ impl GtcrnPlugin {
                 // ============================================================
                 // HF Click / Transient Detector
                 // ============================================================
-                // Clicks (mouse, keyboard, electrical pops) appear as short
-                // bursts of high-frequency energy (>6 kHz) without corresponding
-                // voice-range energy (100–3000 Hz). Real speech always has
-                // fundamental + harmonics in the voice range.
-                //
-                // During silence (vad_gate < 0.3), any HF energy is suspect
-                // and the threshold is lowered significantly.
+                // Detects mouse clicks, keyboard pops, electrical transients.
+                // Conservative: max 40% attenuation, high thresholds to avoid
+                // cutting speech sibilants that also have HF energy.
                 let hf_click_atten = {
-                    // Voice energy: bins 3..96 ≈ 100–3000 Hz (from model spectrum)
                     let mut voice_energy = 0.0f32;
                     for i in 3..96 {
                         let (re, im) = frame.original[i];
                         voice_energy += re * re + im * im;
                     }
 
-                    // HF energy: bins 192..min(full_len, 500) ≈ 6–15.6 kHz
                     let full_len = frame.original_full_spectrum.len();
                     let hf_end = full_len.min(500);
                     let mut hf_energy = 0.0f32;
@@ -596,19 +676,16 @@ impl GtcrnPlugin {
                         hf_energy += c.re * c.re + c.im * c.im;
                     }
 
-                    // Ratio of HF to voice energy
                     let ratio = if voice_energy > 1e-20 {
                         hf_energy / voice_energy
                     } else if hf_energy > 1e-15 {
-                        // HF present but no voice at all → definitely a click
                         200.0
                     } else {
                         0.0
                     };
 
-                    // EMA smoothing: very fast attack (catch click immediately),
-                    // moderate release (don't ring too long)
-                    const HF_CLICK_ATTACK: f32 = 0.7;
+                    // Slower attack to avoid over-reacting to brief HF bursts
+                    const HF_CLICK_ATTACK: f32 = 0.4;
                     const HF_CLICK_RELEASE: f32 = 0.5;
                     let alpha = if ratio > self.hf_click_ratio_ema {
                         HF_CLICK_ATTACK
@@ -618,19 +695,18 @@ impl GtcrnPlugin {
                     self.hf_click_ratio_ema =
                         self.hf_click_ratio_ema * (1.0 - alpha) + ratio * alpha;
 
-                    // Adaptive threshold: stricter during silence
+                    // High thresholds: only obvious clicks trigger attenuation
                     let (threshold, ceiling) = if self.vad_gate < 0.3 {
-                        // During silence, even moderate HF ratio is suspicious
-                        (2.0f32, 8.0f32)
+                        (5.0f32, 20.0f32)
                     } else {
-                        // During speech, allow more HF (sibilants have some HF)
-                        (8.0f32, 30.0f32)
+                        (15.0f32, 50.0f32)
                     };
 
                     if self.hf_click_ratio_ema > threshold {
                         let t = ((self.hf_click_ratio_ema - threshold) / (ceiling - threshold))
                             .clamp(0.0, 1.0);
-                        1.0 - t * t * 0.98
+                        // Max 40% attenuation (was 98%)
+                        1.0 - t * t * 0.40
                     } else {
                         1.0
                     }
@@ -641,9 +717,10 @@ impl GtcrnPlugin {
                 // ============================================================
                 let ve = cfg.voice_enhance;
 
-                // Spectral smoothing: active when ve >= 0.1, during speech
+                // Spectral smoothing: fill spectral dips to reduce "musical noise"
+                // artifact from model. Scaled across full range: 0.0 at ve=0.1, 1.0 at ve=1.0
                 if ve >= 0.1 && self.vad_gate > 0.3 {
-                    let smooth_strength = ((ve - 0.1) / 0.4).clamp(0.0, 1.0);
+                    let smooth_strength = ((ve - 0.1) / 0.9).clamp(0.0, 1.0);
                     let mut magnitudes = [0.0f32; NUM_FREQ_BINS];
                     for i in 0..NUM_FREQ_BINS {
                         let (re, im) = final_spectrum[i];
@@ -666,7 +743,9 @@ impl GtcrnPlugin {
                 }
 
                 // De-essing: gentle sibilance reduction (4-8kHz vs 500Hz-4kHz)
-                if ve >= 0.3 && self.vad_gate > 0.4 {
+                // Only active at higher VE levels; conservative threshold to
+                // avoid cutting legitimate speech fricatives.
+                if ve >= 0.5 && self.vad_gate > 0.4 {
                     let mut voiced_energy = 0.0f32;
                     for &(re, im) in &final_spectrum[16..128] {
                         voiced_energy += re * re + im * im;
@@ -680,10 +759,12 @@ impl GtcrnPlugin {
                     self.deess_ratio_smooth =
                         self.deess_ratio_smooth * (1.0 - DEESS_SMOOTH) + ratio * DEESS_SMOOTH;
 
-                    let threshold = 1.2 - (ve - 0.3) * 0.2;
+                    // More conservative threshold: 1.5 at ve=0.5, 1.2 at ve=1.0
+                    let threshold = 1.5 - (ve - 0.5) * 0.6;
                     if self.deess_ratio_smooth > threshold {
                         let excess = (self.deess_ratio_smooth - threshold) / threshold;
-                        let reduction = (1.0 - excess.min(1.0) * 0.3).max(MAX_DEESS_REDUCTION);
+                        // Max 20% reduction (was 30%), floor 0.80 (was 0.71)
+                        let reduction = (1.0 - excess.min(1.0) * 0.2).max(MAX_DEESS_REDUCTION);
                         let vad_blend = ((self.vad_gate - 0.4) / 0.6).clamp(0.0, 1.0);
                         let atten = 1.0 - (1.0 - reduction) * vad_blend;
                         for (i, fs) in final_spectrum
@@ -731,6 +812,7 @@ impl GtcrnPlugin {
                 }
 
                 // Harmonic Enhancement: active when ve >= 0.3, during speech
+                // Scale over full range: 0.0 at ve=0.3, 1.0 at ve=1.0
                 if ve >= 0.3 && self.vad_gate > 0.3 {
                     let harm_strength = ((ve - 0.3) / 0.7).clamp(0.0, 1.0);
                     let speech_blend = ((self.vad_gate - 0.3) / 0.5).clamp(0.0, 1.0);
@@ -748,15 +830,78 @@ impl GtcrnPlugin {
                     0.0
                 };
 
+                // ============================================================
+                // 8 kHz click suppressor (frequency-selective)
+                // ============================================================
+                // Mouse clicks resonate near 8 kHz with extreme HF/LF ratio
+                // (>30 dB above 6 kHz, near zero below 4 kHz).
+                // The model often passes these through because they sit at
+                // its frequency boundary. We detect this spectral shape and
+                // attenuate bins 128-256 (4-8 kHz) of the final spectrum,
+                // which removes the click without affecting lower speech.
+                // Controlled by noise_gate intensity.
+                let mut click_atten = 1.0f32;
+                if cfg.noise_gate > 0.01 {
+                    // Energy at 6-8 kHz (bins 192-256) vs 0-3 kHz (bins 3-96)
+                    // in the POST-blend final_spectrum.
+                    let upper_e: f32 = final_spectrum[192..NUM_FREQ_BINS]
+                        .iter()
+                        .map(|&(re, im)| re * re + im * im)
+                        .sum();
+                    let lower_e: f32 = final_spectrum[3..96]
+                        .iter()
+                        .map(|&(re, im)| re * re + im * im)
+                        .sum();
+
+                    let click_ratio = if lower_e > 1e-20 {
+                        upper_e / lower_e
+                    } else if upper_e > 1e-15 {
+                        200.0
+                    } else {
+                        0.0
+                    };
+
+                    // EMA smooth for click ratio (fast attack, moderate release)
+                    const CLICK8K_ATTACK: f32 = 0.6;
+                    const CLICK8K_RELEASE: f32 = 0.3;
+                    let alpha = if click_ratio > self.click_8k_ema {
+                        CLICK8K_ATTACK
+                    } else {
+                        CLICK8K_RELEASE
+                    };
+                    self.click_8k_ema = self.click_8k_ema * (1.0 - alpha) + click_ratio * alpha;
+
+                    // Threshold: ratio > 10 starts suppression, > 50 = full.
+                    // Sibilants typically have ratio < 8 because they have
+                    // significant voice energy below 3 kHz.
+                    const CLICK8K_THRESHOLD: f32 = 10.0;
+                    const CLICK8K_CEILING: f32 = 50.0;
+                    if self.click_8k_ema > CLICK8K_THRESHOLD {
+                        let t = ((self.click_8k_ema - CLICK8K_THRESHOLD)
+                            / (CLICK8K_CEILING - CLICK8K_THRESHOLD))
+                            .clamp(0.0, 1.0);
+                        // Up to 95% attenuation of 4-8 kHz bins, scaled by noise_gate
+                        click_atten = 1.0 - t * t * 0.95 * cfg.noise_gate;
+                        // Apply to upper model bins (4-8 kHz, bins 128-256)
+                        for bin in &mut final_spectrum[128..NUM_FREQ_BINS] {
+                            bin.0 *= click_atten;
+                            bin.1 *= click_atten;
+                        }
+                    }
+                }
+
                 // iSTFT synthesis — HighBandProcessor handles HF internally
                 // voice_enhance controls HF reconstruction: 0.0 = cut all HF,
                 // 1.0 = full reconstruction.
+                // click_atten propagates 8kHz click suppression to HF band (8-24kHz).
                 let synth = self.stft.synthesize(
                     &final_spectrum,
                     &frame.original_full_spectrum,
                     self.vad_gate,
-                    false,
                     ve,
+                    cfg.noise_gate,
+                    model_suppress,
+                    click_atten,
                 );
                 let proc_len = synth.len();
 
@@ -786,14 +931,16 @@ impl GtcrnPlugin {
                         let ratio = self.rms_in_smooth / self.rms_out_smooth;
                         if ratio > 1.0 {
                             // Output softer than input — restore, capped at input level
-                            let gc_strength = ((ve - 0.1) / 0.4).clamp(0.0, 1.0);
+                            // Scale over full range: 0.0 at ve=0.1, 1.0 at ve=1.0
+                            let gc_strength = ((ve - 0.1) / 0.9).clamp(0.0, 1.0);
                             let vad_blend =
                                 ((self.vad_gate - 0.3) / 0.7).clamp(0.0, 1.0) * gc_strength;
                             gain = 1.0 + (ratio.min(MAX_GAIN_COMP_RATIO) - 1.0) * vad_blend;
-                        } else if ratio < 0.9 {
-                            // Output louder than input — attenuate to match input level
-                            let atten = ratio / 0.9; // gentle pull-down
-                            gain = 1.0 + (atten - 1.0) * 0.5; // 50% correction speed
+                        } else if ratio < 0.85 {
+                            // Output louder than input — very gentle pull-down
+                            // Only correct 25% per frame to avoid pumping artifacts
+                            let atten = ratio / 0.85;
+                            gain = 1.0 + (atten - 1.0) * 0.25;
                         }
                     }
                 }
@@ -805,13 +952,25 @@ impl GtcrnPlugin {
                     }
                 }
 
-                // Apply non-vocal noise attenuation (time-domain, affects all bands)
-                // Combines spectral flatness gate (candy wrappers, rustling) and
-                // HF click detector (mouse clicks, keyboard, electrical pops)
-                let combined_atten = flatness_atten * hf_click_atten;
-                if combined_atten < 0.99 {
-                    for s in &mut self.output_accum[processed_start..processed_start + proc_len] {
-                        *s *= combined_atten;
+                // Noise gate attenuation (time-domain): only during silence.
+                // During speech, the HF spectral gate in stft.rs handles gating
+                // on the HF band specifically. The full-signal gate here only
+                // applies when there's no speech detected (click suppression).
+                if cfg.noise_gate > 0.01 && self.vad_gate < 0.3 {
+                    let ng = cfg.noise_gate;
+
+                    // During silence: apply both flatness and click gates
+                    let flatness_depth = (1.0 - flatness_atten) * ng;
+                    let gated_flatness = 1.0 - flatness_depth;
+                    let click_depth = (1.0 - hf_click_atten) * ng;
+                    let gated_click = 1.0 - click_depth;
+
+                    let combined_atten = gated_flatness * gated_click;
+                    if combined_atten < 0.99 {
+                        for s in &mut self.output_accum[processed_start..processed_start + proc_len]
+                        {
+                            *s *= combined_atten;
+                        }
                     }
                 }
 
@@ -979,6 +1138,7 @@ impl Plugin for GtcrnPlugin {
         let lookahead_ms_control = *ports[PORT_LOOKAHEAD_MS].unwrap_control();
         let voice_enhance_control = *ports[PORT_VOICE_ENHANCE].unwrap_control();
         let model_blend_control = *ports[PORT_MODEL_BLEND].unwrap_control();
+        let noise_gate_control = *ports[PORT_NOISE_GATE].unwrap_control();
 
         // Poll external control file for live parameter updates
         self.ext_controls.poll();
@@ -1012,6 +1172,11 @@ impl Plugin for GtcrnPlugin {
             self.ext_controls.model_blend
         } else {
             model_blend_control
+        };
+        let noise_gate_val = if self.ext_controls.available && self.ext_controls.noise_gate >= 0.0 {
+            self.ext_controls.noise_gate
+        } else {
+            noise_gate_control
         };
 
         // Bypass mode: pass through input directly
@@ -1052,7 +1217,8 @@ impl Plugin for GtcrnPlugin {
             }
         } else {
             self.model_blend_zero_count += 1;
-            if self.model_blend_zero_count > DUAL_MODEL_UNLOAD_FRAMES && self.second_model.is_some() {
+            if self.model_blend_zero_count > DUAL_MODEL_UNLOAD_FRAMES && self.second_model.is_some()
+            {
                 self.second_model = None;
             }
         }
@@ -1084,6 +1250,7 @@ impl Plugin for GtcrnPlugin {
             speech_strength,
             voice_enhance: voice_enhance_val.clamp(0.0, 1.0),
             model_blend,
+            noise_gate: noise_gate_val.clamp(0.0, 1.0),
         };
 
         // Process pipeline
@@ -1137,7 +1304,10 @@ mod tests {
         // At 44.1 kHz, nfft=1412, hop=706 → frame_ms ≈ 16.01 ms
         assert_eq!(ms_to_frames(706, 44100.0, 0.0), 0);
         let frames_50 = ms_to_frames(706, 44100.0, 50.0);
-        assert!(frames_50 == 3 || frames_50 == 4, "expected 3 or 4, got {frames_50}");
+        assert!(
+            frames_50 == 3 || frames_50 == 4,
+            "expected 3 or 4, got {frames_50}"
+        );
     }
 
     #[test]
