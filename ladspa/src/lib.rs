@@ -38,16 +38,12 @@ pub const PORT_SPEECH_STRENGTH: usize = 5;
 /// Port index for lookahead in milliseconds (output delay enabling pre-speech detection)
 pub const PORT_LOOKAHEAD_MS: usize = 6;
 
-/// Port index for voice enhancement level (0=off, 0.75=default, 1.0=max)
-/// Internally controls: GainComp, SpectralSmooth, HfDucking, BWE, HarmonicEnhance
-pub const PORT_VOICE_ENHANCE: usize = 7;
-
 /// Port index for model blending control (0=off, 1=dual-model VAD-switched)
-pub const PORT_MODEL_BLEND: usize = 8;
+pub const PORT_MODEL_BLEND: usize = 7;
 
-/// Port index for noise gate level (spectral flatness + HF click detection)
-/// 0.0 = disabled, 0.5 = default/moderate, 1.0 = aggressive
-pub const PORT_NOISE_GATE: usize = 9;
+/// Port index for voice recovery level (>8kHz reconstruction)
+/// 0.0 = cut all HF, 0.7 = natural default, 1.0 = full original HF
+pub const PORT_VOICE_RECOVERY: usize = 8;
 
 /// Returns the LADSPA plugin descriptor.
 #[no_mangle]
@@ -123,14 +119,6 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 upper_bound: Some(200.0),
             },
             Port {
-                name: "VoiceEnhance",
-                desc: PortDescriptor::ControlInput,
-                hint: None,
-                default: Some(DefaultValue::Middle), // 0.50 — best WER (v7 test)
-                lower_bound: Some(0.0),
-                upper_bound: Some(1.0),
-            },
-            Port {
                 name: "ModelBlend",
                 desc: PortDescriptor::ControlInput,
                 hint: None, // NOT HINT_TOGGLED: PipeWire 1.6.x sets toggled defaults to 0
@@ -139,10 +127,10 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 upper_bound: Some(1.0),
             },
             Port {
-                name: "NoiseGate",
+                name: "VoiceRecovery",
                 desc: PortDescriptor::ControlInput,
                 hint: None,
-                default: Some(DefaultValue::Middle), // 0.5 — moderate noise gating
+                default: Some(DefaultValue::High), // 0.75 — natural HF level
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
             },

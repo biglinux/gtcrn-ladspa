@@ -87,7 +87,6 @@ impl HighBandProcessor {
         hf_original: &[Complex<f32>],
         enhanced_low: &[(f32, f32); NUM_FREQ_BINS],
         vad_probability: f32,
-        noise_gate: f32,
         output: &mut [Complex<f32>],
     ) {
         self.update_noise_floor(hf_original, vad_probability);
@@ -104,7 +103,7 @@ impl HighBandProcessor {
         if hf_snr < 2.0 && self.hf_noise_initialized {
             self.synthesize_air(enhanced_low, output);
         } else {
-            self.spectral_gate(hf_original, vad_probability, noise_gate, output);
+            self.spectral_gate(hf_original, vad_probability, output);
         }
     }
 
@@ -142,28 +141,19 @@ impl HighBandProcessor {
         flux / (avg_mag * count as f32) > 0.35
     }
 
-    /// Transient-aware spectral gate driven by VAD probability and noise_gate intensity.
+    /// Transient-aware spectral gate driven by VAD probability.
     ///
     /// During speech: HF passes with per-bin SNR gating.
-    /// During silence: HF fully attenuated (scaled by noise_gate).
+    /// During silence: HF fully attenuated.
     /// During transient hold (~20 ms): gate bypassed for consonant crispness.
-    /// noise_gate controls how aggressive the gating is (0.0 = permissive, 1.0 = strict).
     fn spectral_gate(
         &self,
         hf: &[Complex<f32>],
         vad_probability: f32,
-        noise_gate: f32,
         output: &mut [Complex<f32>],
     ) {
-        // When noise_gate is high, reduce transient hold bypass benefit
-        // to prevent mouse clicks from passing through as "consonants".
         let gate_bypassed = self.transient_hold > 0;
-        let bypass_floor = if gate_bypassed {
-            // ng=0 → 0.5 (generous bypass), ng=1 → 0.1 (mostly gated)
-            0.5 * (1.0 - noise_gate * 0.8)
-        } else {
-            0.0
-        };
+        let bypass_floor = if gate_bypassed { 0.5 } else { 0.0 };
         let envelope = if gate_bypassed || vad_probability > 0.7 {
             1.0
         } else if vad_probability > 0.1 {
@@ -174,11 +164,9 @@ impl HighBandProcessor {
 
         let count = hf.len().min(output.len());
 
-        // noise_gate raises the SNR threshold: more HF bins get cut.
-        // At ng=0: threshold=1.0 (permissive), at ng=1: threshold=3.0 (strict).
-        let snr_threshold = 1.0 + noise_gate * 2.0;
-        // Wider transition range at higher noise_gate for smoother gating.
-        let snr_range = 3.5 + noise_gate * 2.0;
+        // Fixed SNR threshold
+        let snr_threshold = 1.0;
+        let snr_range = 3.5;
 
         if self.hf_noise_initialized {
             for i in 0..count {
@@ -450,21 +438,14 @@ impl StftProcessor {
     /// * `model_spectrum` – clean 257-bin output from the neural network.
     /// * `original_full_spectrum` – full spectrum from `analyze()` for this frame.
     /// * `vad_strength` – voice activity gate (0.0–1.0).
-    /// * `voice_enhance` – HF reconstruction level (0.0 = cut all HF, 1.0 = full).
-    /// * `noise_gate` – HF noise gate intensity (0.0 = off, 1.0 = aggressive).
-    /// * `model_suppress` – model attenuation ratio (0.0 = kept all, 1.0 = removed all).
-    /// * `click_atten` – click suppression factor (1.0 = no suppression, 0.0 = full).
+    /// * `voice_recovery` – HF reconstruction level (0.0 = cut all HF, 1.0 = full).
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub fn synthesize(
         &mut self,
         model_spectrum: &[(f32, f32); NUM_FREQ_BINS],
         original_full_spectrum: &[Complex<f32>],
         vad_strength: f32,
-        voice_enhance: f32,
-        noise_gate: f32,
-        model_suppress: f32,
-        click_atten: f32,
+        voice_recovery: f32,
     ) -> &[f32] {
         let inv_scale = 1.0 / self.spectrum_scale;
         let n_bins = self.nfft / 2 + 1;
@@ -484,7 +465,6 @@ impl StftProcessor {
                 hf_original,
                 model_spectrum,
                 vad_strength,
-                noise_gate,
                 &mut self.full_spectrum[NUM_FREQ_BINS..n_bins],
             );
 
@@ -523,11 +503,11 @@ impl StftProcessor {
             }
         }
 
-        // Scale HF band by voice_enhance level (non-linear).
+        // Scale HF band by voice_recovery level (non-linear).
         // Uses sqrt curve so the slider feels more natural:
-        //   ve=0.0 → 0.0 (silent), ve=0.25 → 0.50, ve=0.5 → 0.71, ve=1.0 → 1.0
-        // This preserves consonant clarity at moderate VE settings.
-        let hf_scale = voice_enhance.sqrt();
+        //   vr=0.0 → 0.0 (silent), vr=0.25 → 0.50, vr=0.5 → 0.71, vr=1.0 → 1.0
+        // This preserves consonant clarity at moderate settings.
+        let hf_scale = voice_recovery.sqrt();
         if hf_scale < 0.99 {
             for bin in &mut self.full_spectrum[NUM_FREQ_BINS..n_bins] {
                 bin.re *= hf_scale;
@@ -535,37 +515,32 @@ impl StftProcessor {
             }
         }
 
-        // ── Model-guided HF noise suppression ─────────────────────────
-        // The neural network makes clean/noise decisions for 0–8 kHz.
-        // model_suppress is computed from pure model output vs original
-        // in the 4–8 kHz band (before VE processing).
-        // When the model removed noise/clicks from the low band, we apply
-        // the same suppression to the HF band, scaled by noise_gate.
-        // Only during confirmed silence (vad < 0.3) to avoid suppressing
-        // the onset of speech after a pause.
-        if noise_gate > 0.01 && model_suppress > 0.05 && vad_strength < 0.3 {
-            // Aggressive suppression: square the model removal ratio
-            // so that partial attenuation (model_suppress=0.5) becomes
-            // strong HF suppression (0.25 at ng=1).
-            let suppress_factor = 1.0 - model_suppress * model_suppress * noise_gate;
-            let suppress_factor = suppress_factor.clamp(0.0, 1.0);
-            if suppress_factor < 0.99 {
-                for bin in &mut self.full_spectrum[NUM_FREQ_BINS..n_bins] {
-                    bin.re *= suppress_factor;
-                    bin.im *= suppress_factor;
-                }
-            }
-        }
+        // ── HF energy limiter ─────────────────────────────────────────
+        // Ensure HF band (>8kHz) never has more energy per bin than the
+        // model-cleaned LF band (<8kHz). This prevents the situation where
+        // noise above 8kHz (unfiltered by the neural network) is louder
+        // than the clean signal below 8kHz, creating an "inverted" spectrum.
+        // Allows up to 50% above LF energy to preserve natural brightness.
+        {
+            let lf_energy: f32 = self.full_spectrum[..NUM_FREQ_BINS]
+                .iter()
+                .map(|c| c.re * c.re + c.im * c.im)
+                .sum();
+            let hf_energy: f32 = self.full_spectrum[NUM_FREQ_BINS..n_bins]
+                .iter()
+                .map(|c| c.re * c.re + c.im * c.im)
+                .sum();
 
-        // ── Click suppression for HF band ─────────────────────────────
-        // When plugin.rs detects an 8kHz click in the model bins, it
-        // also sends click_atten < 1.0 so the HF band (8-24kHz) gets
-        // the same attenuation. Without this, click energy above 8kHz
-        // passes through the spectral gate unattenuated.
-        if click_atten < 0.99 {
-            for bin in &mut self.full_spectrum[NUM_FREQ_BINS..n_bins] {
-                bin.re *= click_atten;
-                bin.im *= click_atten;
+            let lf_per_bin = lf_energy / NUM_FREQ_BINS as f32;
+            let hf_per_bin = hf_energy / hf_count.max(1) as f32;
+
+            // HF energy per bin must not exceed 1.5× LF energy per bin
+            if hf_per_bin > lf_per_bin * 1.5 && lf_per_bin > 1e-10 {
+                let limit = (lf_per_bin * 1.5 / hf_per_bin).sqrt();
+                for bin in &mut self.full_spectrum[NUM_FREQ_BINS..n_bins] {
+                    bin.re *= limit;
+                    bin.im *= limit;
+                }
             }
         }
 
