@@ -1,1 +1,0 @@
-cargo:warning=Python venv not found at "/home/bruno/codigo-pacotes/multimidia/gtcrn-ladspa/ladspa/.venv/bin/python", skipping model conversion. Ensure .venv exists if you need to convert models.
