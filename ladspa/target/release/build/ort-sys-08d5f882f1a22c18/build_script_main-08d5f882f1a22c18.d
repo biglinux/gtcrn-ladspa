@@ -1,0 +1,10 @@
+/home/bruno/codigo-pacotes/multimidia/gtcrn-ladspa/ladspa/target/release/build/ort-sys-08d5f882f1a22c18/build_script_main-08d5f882f1a22c18.d: /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/main.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/dynamic_link.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/log.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/static_link/mod.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/static_link/apple.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/vars.rs
+
+/home/bruno/codigo-pacotes/multimidia/gtcrn-ladspa/ladspa/target/release/build/ort-sys-08d5f882f1a22c18/build_script_main-08d5f882f1a22c18: /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/main.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/dynamic_link.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/log.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/static_link/mod.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/static_link/apple.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/vars.rs
+
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/main.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/dynamic_link.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/log.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/static_link/mod.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/static_link/apple.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/build/vars.rs:

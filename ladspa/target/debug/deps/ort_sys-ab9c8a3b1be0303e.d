@@ -1,0 +1,11 @@
+/home/bruno/codigo-pacotes/multimidia/gtcrn-ladspa/ladspa/target/debug/deps/ort_sys-ab9c8a3b1be0303e.d: /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/lib.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/mod.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/dirs.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/stub.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/version.rs
+
+/home/bruno/codigo-pacotes/multimidia/gtcrn-ladspa/ladspa/target/debug/deps/libort_sys-ab9c8a3b1be0303e.rlib: /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/lib.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/mod.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/dirs.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/stub.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/version.rs
+
+/home/bruno/codigo-pacotes/multimidia/gtcrn-ladspa/ladspa/target/debug/deps/libort_sys-ab9c8a3b1be0303e.rmeta: /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/lib.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/mod.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/dirs.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/stub.rs /home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/version.rs
+
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/lib.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/mod.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/internal/dirs.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/stub.rs:
+/home/bruno/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ort-sys-2.0.0-rc.11/src/version.rs:
