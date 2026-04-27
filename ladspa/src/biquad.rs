@@ -17,6 +17,7 @@ impl Biquad {
     ///
     /// `cutoff_hz` — cutoff frequency in Hz
     /// `sample_rate` — sample rate in Hz
+    #[must_use]
     pub fn highpass(cutoff_hz: f32, sample_rate: f32) -> Self {
         let w0 = 2.0 * std::f32::consts::PI * cutoff_hz / sample_rate;
         let cos_w0 = w0.cos();
@@ -28,9 +29,9 @@ impl Biquad {
         let inv_a0 = 1.0 / a0;
 
         Self {
-            b0: ((1.0 + cos_w0) / 2.0) * inv_a0,
+            b0: f32::midpoint(1.0, cos_w0) * inv_a0,
             b1: (-(1.0 + cos_w0)) * inv_a0,
-            b2: ((1.0 + cos_w0) / 2.0) * inv_a0,
+            b2: f32::midpoint(1.0, cos_w0) * inv_a0,
             a1: (-2.0 * cos_w0) * inv_a0,
             a2: (1.0 - alpha) * inv_a0,
             z1: 0.0,
@@ -42,6 +43,7 @@ impl Biquad {
     ///
     /// `cutoff_hz` — cutoff frequency in Hz
     /// `sample_rate` — sample rate in Hz
+    #[must_use]
     pub fn lowpass(cutoff_hz: f32, sample_rate: f32) -> Self {
         let w0 = 2.0 * std::f32::consts::PI * cutoff_hz / sample_rate;
         let cos_w0 = w0.cos();
@@ -54,7 +56,7 @@ impl Biquad {
 
         Self {
             b0: ((1.0 - cos_w0) / 2.0) * inv_a0,
-            b1: ((1.0 - cos_w0)) * inv_a0,
+            b1: (1.0 - cos_w0) * inv_a0,
             b2: ((1.0 - cos_w0) / 2.0) * inv_a0,
             a1: (-2.0 * cos_w0) * inv_a0,
             a2: (1.0 - alpha) * inv_a0,
@@ -94,7 +96,7 @@ mod tests {
     fn highpass_attenuates_dc() {
         let mut bq = Biquad::highpass(80.0, 48000.0);
         // Feed DC signal (constant 1.0) for 2000 samples — output should converge to ~0
-        let mut samples = vec![1.0f32; 2000];
+        let mut samples = vec![1.0_f32; 2000];
         bq.process(&mut samples);
         let last = samples.last().unwrap().abs();
         assert!(last < 0.01, "DC should be attenuated, got {last}");

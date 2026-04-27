@@ -1,18 +1,15 @@
 # Maintainer: Bruno Goncalves <bigbruno@gmail.com>
 
 pkgname=gtcrn-ladspa
+pkgdesc="GTCRN Speech Enhancement LADSPA plugin using ONNX Runtime"
 pkgver=$(date +%y.%m.%d)
 pkgrel=$(date +%H%M)
 arch=('x86_64')
-license=('MIT')
 url="https://github.com/biglinux/gtcrn"
-pkgdesc="GTCRN Speech Enhancement LADSPA plugin using ONNX Runtime"
-depends=('glibc' 'gcc-libs' 'onnxruntime')
-makedepends=('rust' 'cargo' 'git' 'clang' 'python-onnxruntime' 'python-onnx' 'python-typing_extensions')
-provides=(
-	ladspa-host
-)
-
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'onnxruntime-cpu')
+makedepends=('cargo' 'clang' 'git' 'python-onnx' 'python-onnxruntime-cpu' 'python-typing_extensions' 'rust')
+provides=('ladspa-host')
 source=("${pkgname}::git+https://github.com/biglinux/gtcrn.git")
 md5sums=('SKIP')
 
@@ -20,19 +17,17 @@ prepare() {
 	cd "${pkgname}/ladspa"
 	export RUSTUP_TOOLCHAIN=stable
 	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
-
-	# Patch build.rs to use system python instead of .venv and skip existence check
-	sed -i 's|PathBuf::from(manifest_dir).join(".venv/bin/python")|PathBuf::from("python")|g' build.rs
-	sed -i 's|if !python_path.exists()|if false|g' build.rs
 }
 
 build() {
 	cd "${pkgname}/ladspa"
 	export RUSTUP_TOOLCHAIN=stable
 	export CARGO_TARGET_DIR=target
-	export CARGO_BUILD_JOBS=$(nproc)
+	CARGO_BUILD_JOBS=$(nproc)
+	export CARGO_BUILD_JOBS
+	# GTCRN_PYTHON tells build.rs to use the system python instead of .venv/bin/python.
+	export GTCRN_PYTHON=python
 
-	# Dynamic build linked against system onnxruntime
 	cargo build --release --locked --features dynamic --no-default-features
 }
 

@@ -1,14 +1,17 @@
-//! GTCRN LADSPA Plugin using ONNX Runtime with OpenVINO backend.
+//! GTCRN LADSPA Plugin using ONNX Runtime with `OpenVINO` backend.
 //!
 //! This plugin provides real-time speech enhancement using the GTCRN neural network,
-//! with ONNX Runtime as the inference backend. It can use OpenVINO as execution provider
+//! with ONNX Runtime as the inference backend. It can use `OpenVINO` as execution provider
 //! for optimal CPU performance on Intel hardware.
 
 pub mod biquad;
+pub mod external_controls;
 pub mod gate;
+pub mod gate_pass;
 pub mod model;
 pub mod plugin;
 pub mod stft;
+pub mod vad;
 
 use ladspa::{ControlHint, DefaultValue, PluginDescriptor, Port, PortDescriptor, Properties};
 
@@ -49,7 +52,31 @@ pub const PORT_MODEL_BLEND: usize = 7;
 /// 0.0 = cut all HF, 0.7 = natural default, 1.0 = full original HF
 pub const PORT_VOICE_RECOVERY: usize = 8;
 
+/// Port index for gate threshold in dB
+pub const PORT_GATE_THRESHOLD: usize = 9;
+
+/// Port index for gate attack in ms
+pub const PORT_GATE_ATTACK: usize = 10;
+
+/// Port index for gate hold in ms
+pub const PORT_GATE_HOLD: usize = 11;
+
+/// Port index for gate release in ms
+pub const PORT_GATE_RELEASE: usize = 12;
+
+/// Port index for gate range (attenuation) in dB
+pub const PORT_GATE_RANGE: usize = 13;
+
+/// Port index for gate sidechain LF key filter in Hz
+pub const PORT_GATE_LF_KEY: usize = 14;
+
+/// Port index for gate sidechain HF key filter in Hz
+pub const PORT_GATE_HF_KEY: usize = 15;
+
 /// Returns the LADSPA plugin descriptor.
+///
+/// `Option<PluginDescriptor>` is not strict-FFI-safe; the `ladspa` crate
+/// thunks the call into a real C ABI before any host sees it.
 #[no_mangle]
 #[allow(unsafe_code)]
 #[allow(improper_ctypes_definitions)]
@@ -123,9 +150,9 @@ fn gtcrn_descriptor() -> PluginDescriptor {
                 name: "LookaheadMs",
                 desc: PortDescriptor::ControlInput,
                 hint: None,
-                default: Some(DefaultValue::Low), // ~50 ms
+                default: Some(DefaultValue::Low), // ~20 ms (0 + 80*0.25)
                 lower_bound: Some(0.0),
-                upper_bound: Some(200.0),
+                upper_bound: Some(80.0),
             },
             Port {
                 name: "ModelBlend",
@@ -143,12 +170,70 @@ fn gtcrn_descriptor() -> PluginDescriptor {
                 lower_bound: Some(0.0),
                 upper_bound: Some(1.0),
             },
+            // Gate ports (integrated noise gate, processed after GTCRN)
+            Port {
+                name: "Threshold (dB)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Low), // ~ -60 dB
+                lower_bound: Some(-80.0),
+                upper_bound: Some(0.0),
+            },
+            Port {
+                name: "Attack (ms)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Low), // ~10 ms
+                lower_bound: Some(0.1),
+                upper_bound: Some(500.0),
+            },
+            Port {
+                name: "Hold (ms)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Middle), // ~1000 ms
+                lower_bound: Some(0.0),
+                upper_bound: Some(2000.0),
+            },
+            Port {
+                name: "Release (ms)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Low), // ~200 ms
+                lower_bound: Some(1.0),
+                upper_bound: Some(2000.0),
+            },
+            Port {
+                name: "Range (dB)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Minimum), // -90 dB
+                lower_bound: Some(-90.0),
+                upper_bound: Some(0.0),
+            },
+            Port {
+                name: "LF Key Filter (Hz)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Low), // ~200 Hz
+                lower_bound: Some(20.0),
+                upper_bound: Some(20000.0),
+            },
+            Port {
+                name: "HF Key Filter (Hz)",
+                desc: PortDescriptor::ControlInput,
+                hint: None,
+                default: Some(DefaultValue::Low), // ~4000 Hz
+                lower_bound: Some(20.0),
+                upper_bound: Some(20000.0),
+            },
         ],
         new: plugin::GtcrnPlugin::new,
     }
 }
 
 /// Noise gate with sidechain bandpass key filter descriptor.
+#[must_use]
 pub fn gate_descriptor() -> PluginDescriptor {
     PluginDescriptor {
         unique_id: GATE_PLUGIN_ID,

@@ -60,7 +60,7 @@ pub struct HighBandProcessor {
 impl HighBandProcessor {
     /// Creates a processor for the given number of HF bins.
     fn new(hf_bin_count: usize, hop_size: usize, sample_rate: u32) -> Self {
-        let frame_dur_s = hop_size as f64 / sample_rate as f64;
+        let frame_dur_s = hop_size as f64 / f64::from(sample_rate);
         let hold_frames = (0.020 / frame_dur_s).ceil() as usize;
 
         Self {
@@ -78,7 +78,7 @@ impl HighBandProcessor {
     /// Decides between the transient-aware spectral gate (adequate HF SNR)
     /// and the air exciter synthesis (noisy HF) based on estimated SNR.
     ///
-    /// * `hf_original` – original bins 257..n_bins from the analysis frame.
+    /// * `hf_original` – original bins `257..n_bins` from the analysis frame.
     /// * `enhanced_low` – clean 257-bin spectrum from the neural network.
     /// * `vad_probability` – voice activity gate (0.0 = silence, 1.0 = speech).
     /// * `output` – destination slice (same length as `hf_original`).
@@ -117,8 +117,8 @@ impl HighBandProcessor {
             return false;
         }
 
-        let mut flux = 0.0f32;
-        let mut avg_mag = 0.0f32;
+        let mut flux = 0.0_f32;
+        let mut avg_mag = 0.0_f32;
         for (h, prev) in hf[..count].iter().zip(self.prev_hf_mag[..count].iter_mut()) {
             let mag = h.norm();
             avg_mag += mag;
@@ -195,6 +195,7 @@ impl HighBandProcessor {
     ///
     /// Mirrors 4–8 kHz content (bins 128–256) into 8–16 kHz with 2nd-harmonic
     /// generation and a ~6 dB/octave tilt EQ for natural rolloff.
+    #[allow(clippy::unused_self)]
     fn synthesize_air(
         &self,
         enhanced_low: &[(f32, f32); NUM_FREQ_BINS],
@@ -326,7 +327,7 @@ impl StftProcessor {
     /// Creates a processor tuned for the given host sample rate.
     #[must_use]
     pub fn new(sample_rate: u32) -> Self {
-        let ratio = sample_rate as f64 / MODEL_SR;
+        let ratio = f64::from(sample_rate) / MODEL_SR;
         let nfft_raw = (MODEL_NFFT * ratio).round() as usize;
         // Ensure even (required by realfft)
         let nfft = if nfft_raw.is_multiple_of(2) {
@@ -618,7 +619,7 @@ mod tests {
     fn nfft_always_even() {
         // Test several sample rates to ensure NFFT is always even
         for sr in [
-            8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 192000,
+            8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 192_000,
         ] {
             let stft = StftProcessor::new(sr);
             assert!(
@@ -632,7 +633,7 @@ mod tests {
     #[test]
     fn analyze_returns_correct_size() {
         let mut stft = StftProcessor::new(48000);
-        let frame = vec![0.0f32; stft.nfft()];
+        let frame = vec![0.0_f32; stft.nfft()];
         let spectrum = stft.analyze(&frame);
         assert_eq!(spectrum.len(), NUM_FREQ_BINS);
     }
@@ -640,7 +641,7 @@ mod tests {
     #[test]
     fn analyze_silence_produces_near_zero() {
         let mut stft = StftProcessor::new(48000);
-        let frame = vec![0.0f32; stft.nfft()];
+        let frame = vec![0.0_f32; stft.nfft()];
         let spectrum = stft.analyze(&frame);
         let energy: f32 = spectrum.iter().map(|(re, im)| re * re + im * im).sum();
         assert!(
@@ -652,7 +653,7 @@ mod tests {
     #[test]
     fn original_spectrum_length() {
         let mut stft = StftProcessor::new(48000);
-        let frame = vec![0.0f32; stft.nfft()];
+        let frame = vec![0.0_f32; stft.nfft()];
         let _ = stft.analyze(&frame);
         let orig = stft.original_spectrum();
         assert_eq!(orig.len(), stft.nfft() / 2 + 1);
@@ -674,7 +675,7 @@ mod tests {
         let orig_full = stft.original_spectrum().to_vec();
 
         // Synthesize with passthrough (no model modification)
-        let output = stft.synthesize(&spectrum_owned, &orig_full, 1.0, 1.0, 0.5, 0.0, 1.0);
+        let output = stft.synthesize(&spectrum_owned, &orig_full, 1.0, 1.0);
 
         // Output should have non-trivial energy (it's the first frame so overlap-add
         // only produces hop_size samples)
@@ -689,11 +690,11 @@ mod tests {
     fn synthesize_output_length() {
         let mut stft = StftProcessor::new(48000);
         let nfft = stft.nfft();
-        let frame = vec![0.0f32; nfft];
+        let frame = vec![0.0_f32; nfft];
         let spectrum = stft.analyze(&frame);
         let spectrum_owned = *spectrum;
         let orig_full = stft.original_spectrum().to_vec();
-        let output = stft.synthesize(&spectrum_owned, &orig_full, 1.0, 1.0, 0.5, 0.0, 1.0);
+        let output = stft.synthesize(&spectrum_owned, &orig_full, 1.0, 1.0);
         assert_eq!(output.len(), stft.hop_size());
     }
 }

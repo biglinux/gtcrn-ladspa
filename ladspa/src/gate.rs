@@ -4,16 +4,12 @@
 //! sidechain to focus detection on the 200–4000 Hz speech band, rejecting
 //! impulsive noises (mouse clicks, key taps) that fall outside this range.
 //!
-//! Unlike swh gate_1410 whose key filter controls are broken, this
+//! Unlike swh `gate_1410` whose key filter controls are broken, this
 //! implementation handles filter frequencies directly in Hz — no
 //! `HINT_SAMPLE_RATE` normalization issues.
 
 use crate::biquad::Biquad;
 use ladspa::{Plugin, PluginDescriptor, PortConnection};
-
-// =============================================================================
-// Port Indices
-// =============================================================================
 
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;
@@ -25,47 +21,38 @@ const PORT_RANGE: usize = 6;
 const PORT_LF_KEY: usize = 7;
 const PORT_HF_KEY: usize = 8;
 
-// =============================================================================
-// Detector Constants
-// =============================================================================
-
 /// Envelope detector attack time in seconds (fast, to catch speech onsets).
 const DET_ATTACK_S: f32 = 0.001;
 
 /// Envelope detector release time in seconds (smooth between syllables).
 const DET_RELEASE_S: f32 = 0.020;
 
-// =============================================================================
-// Plugin
-// =============================================================================
+/// Pre-allocated sidechain buffer length. Sized to cover any realistic LADSPA
+/// host block; matches `crate::plugin::MAX_HOST_BLOCK` so both pre-sizings
+/// stay in sync.
+const SIDECHAIN_BUF_LEN: usize = 32 * 1024;
 
 /// Noise gate with sidechain bandpass key filter.
-///
-/// Uses cascaded (4th-order) Butterworth filters for the sidechain bandpass,
-/// providing -24 dB/octave rejection of out-of-band signals.
+/// Cascaded (4th-order) Butterworth filters give -24 dB/oct rejection
+/// outside the speech band.
 pub struct GatePlugin {
     sample_rate: f32,
-
-    // Sidechain bandpass filters (cascaded for 4th-order / -24 dB/oct)
     hp_filter_1: Biquad,
     hp_filter_2: Biquad,
     lp_filter_1: Biquad,
     lp_filter_2: Biquad,
     last_lf_hz: f32,
     last_hf_hz: f32,
-
-    // State
     envelope: f32,
     gate_gain: f32,
     hold_counter: u32,
     is_open: bool,
-
-    // Pre-allocated sidechain buffer
     sidechain_buf: Vec<f32>,
 }
 
 impl GatePlugin {
     #[must_use]
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(_desc: &PluginDescriptor, sample_rate: u64) -> Box<dyn Plugin + Send> {
         let sr = sample_rate as f32;
         let default_lf = 200.0;
@@ -83,7 +70,7 @@ impl GatePlugin {
             gate_gain: 0.0, // Start closed
             hold_counter: 0,
             is_open: false,
-            sidechain_buf: Vec::with_capacity(1024),
+            sidechain_buf: vec![0.0; SIDECHAIN_BUF_LEN],
         })
     }
 }
@@ -105,7 +92,6 @@ impl Plugin for GatePlugin {
         let lf_hz = *ports[PORT_LF_KEY].unwrap_control();
         let hf_hz = *ports[PORT_HF_KEY].unwrap_control();
 
-        // Recreate sidechain filters if frequency controls changed
         let lf_clamped = lf_hz.clamp(20.0, 20000.0);
         let hf_clamped = hf_hz.clamp(20.0, 20000.0);
 
@@ -120,7 +106,6 @@ impl Plugin for GatePlugin {
             self.last_hf_hz = hf_clamped;
         }
 
-        // Pre-compute constants
         let threshold_linear = db_to_linear(threshold_db.clamp(-80.0, 0.0));
         let range_linear = db_to_linear(range_db.clamp(-90.0, 0.0));
         let gate_attack = smooth_coeff(attack_ms.max(0.1) / 1000.0, self.sample_rate);
@@ -130,39 +115,37 @@ impl Plugin for GatePlugin {
         let det_attack = smooth_coeff(DET_ATTACK_S, self.sample_rate);
         let det_release = smooth_coeff(DET_RELEASE_S, self.sample_rate);
 
-        // Prepare sidechain buffer (reuse allocation)
         self.sidechain_buf.resize(sample_count, 0.0);
         self.sidechain_buf[..sample_count].copy_from_slice(&input[..sample_count]);
 
-        // Apply 4th-order bandpass to sidechain: HP(LF) × 2 → LP(HF) × 2
-        self.hp_filter_1.process(&mut self.sidechain_buf[..sample_count]);
-        self.hp_filter_2.process(&mut self.sidechain_buf[..sample_count]);
-        self.lp_filter_1.process(&mut self.sidechain_buf[..sample_count]);
-        self.lp_filter_2.process(&mut self.sidechain_buf[..sample_count]);
+        // 4th-order bandpass: HP(LF) × 2 → LP(HF) × 2.
+        self.hp_filter_1
+            .process(&mut self.sidechain_buf[..sample_count]);
+        self.hp_filter_2
+            .process(&mut self.sidechain_buf[..sample_count]);
+        self.lp_filter_1
+            .process(&mut self.sidechain_buf[..sample_count]);
+        self.lp_filter_2
+            .process(&mut self.sidechain_buf[..sample_count]);
 
-        // Per-sample processing
         for i in 0..sample_count {
             let sc_level = self.sidechain_buf[i].abs();
 
-            // Peak envelope follower
             if sc_level > self.envelope {
                 self.envelope += det_attack * (sc_level - self.envelope);
             } else {
                 self.envelope += det_release * (sc_level - self.envelope);
             }
 
-            // Gate state machine
             if self.envelope >= threshold_linear {
                 self.is_open = true;
                 self.hold_counter = hold_samples;
             } else if self.hold_counter > 0 {
                 self.hold_counter -= 1;
-                // Stay open during hold period
             } else {
                 self.is_open = false;
             }
 
-            // Smooth gate gain toward target
             let target = if self.is_open { 1.0 } else { range_linear };
             if self.gate_gain < target {
                 self.gate_gain += gate_attack * (target - self.gate_gain);
@@ -181,7 +164,7 @@ impl Plugin for GatePlugin {
 
 /// Convert dB to linear amplitude.
 #[inline]
-fn db_to_linear(db: f32) -> f32 {
+pub(crate) fn db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
 
@@ -190,7 +173,7 @@ fn db_to_linear(db: f32) -> f32 {
 /// Returns `1 - exp(-1 / (time_s * sample_rate))`.
 /// Higher values = faster response.
 #[inline]
-fn smooth_coeff(time_s: f32, sample_rate: f32) -> f32 {
+pub(crate) fn smooth_coeff(time_s: f32, sample_rate: f32) -> f32 {
     if time_s <= 0.0 {
         return 1.0;
     }
@@ -228,17 +211,19 @@ mod tests {
         let mut gate = GatePlugin::new(&desc, 48000);
 
         // Feed 4800 samples of silence (100ms) — gate should stay closed
-        let silence = vec![0.0f32; 4800];
-        let mut out = vec![0.0f32; 4800];
-        let threshold = -30.0f32;
-        let attack = 10.0f32;
-        let hold = 400.0f32;
-        let release = 200.0f32;
-        let range = -90.0f32;
-        let lf = 200.0f32;
-        let hf = 4000.0f32;
+        let silence = vec![0.0_f32; 4800];
+        let mut out = vec![0.0_f32; 4800];
+        let threshold = -30.0_f32;
+        let attack = 10.0_f32;
+        let hold = 400.0_f32;
+        let release = 200.0_f32;
+        let range = -90.0_f32;
+        let lf = 200.0_f32;
+        let hf = 4000.0_f32;
 
-        let ports = make_ports(&silence, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf);
+        let ports = make_ports(
+            &silence, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf,
+        );
         let port_refs: Vec<&PortConnection> = ports.iter().collect();
         gate.run(4800, &port_refs);
 
@@ -261,17 +246,19 @@ mod tests {
         let tone: Vec<f32> = (0..n)
             .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
             .collect();
-        let mut out = vec![0.0f32; n];
+        let mut out = vec![0.0_f32; n];
 
-        let threshold = -30.0f32;
-        let attack = 10.0f32;
-        let hold = 400.0f32;
-        let release = 200.0f32;
-        let range = -90.0f32;
-        let lf = 200.0f32;
-        let hf = 4000.0f32;
+        let threshold = -30.0_f32;
+        let attack = 10.0_f32;
+        let hold = 400.0_f32;
+        let release = 200.0_f32;
+        let range = -90.0_f32;
+        let lf = 200.0_f32;
+        let hf = 4000.0_f32;
 
-        let ports = make_ports(&tone, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf);
+        let ports = make_ports(
+            &tone, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf,
+        );
         let port_refs: Vec<&PortConnection> = ports.iter().collect();
         gate.run(n, &port_refs);
 
@@ -294,17 +281,19 @@ mod tests {
         let tone: Vec<f32> = (0..n)
             .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
             .collect();
-        let mut out = vec![0.0f32; n];
+        let mut out = vec![0.0_f32; n];
 
-        let threshold = -30.0f32;
-        let attack = 10.0f32;
-        let hold = 0.0f32; // No hold — gate should close quickly
-        let release = 10.0f32; // Fast release
-        let range = -90.0f32;
-        let lf = 200.0f32;
-        let hf = 4000.0f32;
+        let threshold = -30.0_f32;
+        let attack = 10.0_f32;
+        let hold = 0.0_f32; // No hold — gate should close quickly
+        let release = 10.0_f32; // Fast release
+        let range = -90.0_f32;
+        let lf = 200.0_f32;
+        let hf = 4000.0_f32;
 
-        let ports = make_ports(&tone, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf);
+        let ports = make_ports(
+            &tone, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf,
+        );
         let port_refs: Vec<&PortConnection> = ports.iter().collect();
         gate.run(n, &port_refs);
 
@@ -312,7 +301,10 @@ mod tests {
         // The gate should NOT open (or barely open), so output should be very quiet.
         let tail = &out[n / 2..]; // Second half (steady state)
         let rms: f32 = (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt();
-        assert!(rms < 0.05, "50 Hz should NOT open gate with LF=200 Hz, rms={rms}");
+        assert!(
+            rms < 0.05,
+            "50 Hz should NOT open gate with LF=200 Hz, rms={rms}"
+        );
     }
 
     #[test]
@@ -328,24 +320,29 @@ mod tests {
         let tone: Vec<f32> = (0..n)
             .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
             .collect();
-        let mut out = vec![0.0f32; n];
+        let mut out = vec![0.0_f32; n];
 
-        let threshold = -30.0f32;
-        let attack = 10.0f32;
-        let hold = 0.0f32;
-        let release = 10.0f32;
-        let range = -90.0f32;
-        let lf = 200.0f32;
-        let hf = 4000.0f32;
+        let threshold = -30.0_f32;
+        let attack = 10.0_f32;
+        let hold = 0.0_f32;
+        let release = 10.0_f32;
+        let range = -90.0_f32;
+        let lf = 200.0_f32;
+        let hf = 4000.0_f32;
 
-        let ports = make_ports(&tone, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf);
+        let ports = make_ports(
+            &tone, &mut out, &threshold, &attack, &hold, &release, &range, &lf, &hf,
+        );
         let port_refs: Vec<&PortConnection> = ports.iter().collect();
         gate.run(n, &port_refs);
 
         // 10 kHz is heavily attenuated by the 4000 Hz lowpass key filter.
         let tail = &out[n / 2..];
         let rms: f32 = (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt();
-        assert!(rms < 0.05, "10 kHz should NOT open gate with HF=4000 Hz, rms={rms}");
+        assert!(
+            rms < 0.05,
+            "10 kHz should NOT open gate with HF=4000 Hz, rms={rms}"
+        );
     }
 
     // =========================================================================
@@ -356,6 +353,7 @@ mod tests {
         crate::gate_descriptor()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_ports<'a>(
         input: &'a [f32],
         output: &'a mut [f32],
@@ -367,16 +365,71 @@ mod tests {
         lf: &'a f32,
         hf: &'a f32,
     ) -> Vec<PortConnection<'a>> {
+        use ladspa::{Port, PortData, PortDescriptor};
+        use std::cell::RefCell;
+
+        let ai_port = Port {
+            name: "Input",
+            desc: PortDescriptor::AudioInput,
+            hint: None,
+            default: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+        let ao_port = Port {
+            name: "Output",
+            desc: PortDescriptor::AudioOutput,
+            hint: None,
+            default: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+        let ci_port = Port {
+            name: "Control",
+            desc: PortDescriptor::ControlInput,
+            hint: None,
+            default: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+
         vec![
-            PortConnection::AudioInput(input),
-            PortConnection::AudioOutput(output),
-            PortConnection::ControlInput(threshold),
-            PortConnection::ControlInput(attack),
-            PortConnection::ControlInput(hold),
-            PortConnection::ControlInput(release),
-            PortConnection::ControlInput(range),
-            PortConnection::ControlInput(lf),
-            PortConnection::ControlInput(hf),
+            PortConnection {
+                port: ai_port,
+                data: PortData::AudioInput(input),
+            },
+            PortConnection {
+                port: ao_port,
+                data: PortData::AudioOutput(RefCell::new(output)),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(threshold),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(attack),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(hold),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(release),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(range),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(lf),
+            },
+            PortConnection {
+                port: ci_port,
+                data: PortData::ControlInput(hf),
+            },
         ]
     }
 }

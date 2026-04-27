@@ -1,6 +1,6 @@
 //! GTCRN LADSPA Plugin implementation.
 //!
-//! Processes audio synchronously within run() for compatibility with
+//! Processes audio synchronously inside `run()` for compatibility with
 //! both real-time hosts (PipeWire/PulseAudio) and offline hosts (ffmpeg).
 //!
 //! ## Architecture
@@ -11,164 +11,105 @@
 //! ```text
 //! run() callback (synchronous)
 //! ┌──────────────────────────────────────────────┐
-//! │ input → STFT(N) → scale → Model → unscale   │
-//! │         → iSTFT(N) → out                     │
+//! │ input → HP → STFT → Model → blend → iSTFT    │
+//! │       → output → gate-pass                   │
 //! └──────────────────────────────────────────────┘
 //! ```
+//!
+//! Heavy lifting is delegated to dedicated modules:
+//! - [`crate::external_controls`] — live parameter polling from tmpfs.
+//! - [`crate::vad`] — voice-activity detection helpers.
+//! - [`crate::gate_pass`] — sidechain noise gate post-stage.
 
 use std::collections::VecDeque;
 
 use realfft::num_complex::Complex;
 
 use crate::biquad::Biquad;
+use crate::external_controls::ExternalControls;
+use crate::gate_pass::{apply_gate_pass, GateState};
 use crate::model::{GtcrnModel, ModelType, NUM_FREQ_BINS};
 use crate::stft::StftProcessor;
+use crate::vad::{
+    detect_onset, dns3_energy_ratio_vad, effective_strength, spectrum_energy, step_vad_gate,
+    update_noise_floor, vctk_input_only_vad,
+};
 use crate::{
-    PORT_ENABLE, PORT_INPUT, PORT_LOOKAHEAD_MS, PORT_MODEL, PORT_MODEL_BLEND,
-    PORT_OUTPUT, PORT_SPEECH_STRENGTH, PORT_STRENGTH, PORT_VOICE_RECOVERY,
+    PORT_ENABLE, PORT_INPUT, PORT_LOOKAHEAD_MS, PORT_MODEL, PORT_MODEL_BLEND, PORT_OUTPUT,
+    PORT_SPEECH_STRENGTH, PORT_STRENGTH, PORT_VOICE_RECOVERY,
 };
 use ladspa::{Plugin, PluginDescriptor, PortConnection};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Highpass pre-filter cutoff (Hz). Removes sub-audible content that
+/// confuses the GTCRN model.
+const HP_CUTOFF_HZ: f32 = 80.0;
+
+/// Frames with `model_blend = false` before the secondary model unloads.
+/// At ~62 fps (48 kHz, hop=768) this is ≈1.6 s.
+const DUAL_MODEL_UNLOAD_FRAMES: usize = 100;
+
+/// Maximum host audio block we pre-allocate buffers for. 32k samples is
+/// ~680 ms at 48 kHz — well above any realistic LADSPA host block. Hosts
+/// that exceed this still work via `Vec::resize`, but the common path
+/// stays allocation-free.
+const MAX_HOST_BLOCK: usize = 32 * 1024;
+
+/// How many spectrum buffers to keep in the lookahead pool. Sized for the
+/// largest practical lookahead (~200 ms / hop) plus headroom — beyond
+/// this the pool falls back to allocating a fresh `Vec` on the audio
+/// thread, which is what we want to avoid.
+const SPECTRUM_POOL_CAPACITY: usize = 32;
+
+/// Per-frame normalization constants. The model was trained on typical
+/// speech levels; quiet input has magnitudes too small for it to
+/// distinguish from noise, causing over-suppression.
+const NORM_TARGET_RMS: f32 = 0.5;
+const NORM_MIN_RMS: f32 = 0.02;
+const NORM_MAX_GAIN: f32 = 3.0;
+const NORM_EMA: f32 = 0.15;
 
 // =============================================================================
 // Process Configuration
 // =============================================================================
 
-/// All per-frame processing parameters collected into a single struct.
+/// All resolved per-block parameters used inside [`GtcrnPlugin::process_frames`].
 struct ProcessConfig {
     noise_strength: f32,
     speech_strength: f32,
     model_blend: bool,
-    /// Voice recovery level (0.0 = cut all >8kHz, 1.0 = full original).
+    /// Voice recovery level (0.0 = cut all >8 kHz, 1.0 = full original).
     voice_recovery: f32,
 }
-// =============================================================================
-// Constants
-// =============================================================================
 
-/// Highpass pre-filter cutoff frequency in Hz.
-/// Removes sub-audible content that confuses the GTCRN model.
-const HP_CUTOFF_HZ: f32 = 80.0;
-
-/// VAD decay smoothing coefficient (EMA).
-/// Higher = slower decay, more stable gate. `0.92` ≈ 190 ms time constant at 62 fps.
-const VAD_DECAY_COEFF: f32 = 0.92;
-
-/// Number of `run()` calls with model_blend=0 before unloading the secondary model.
-/// At ~62 frames/sec (48 kHz, hop=768) this is ≈1.6 seconds.
-const DUAL_MODEL_UNLOAD_FRAMES: usize = 100;
-
-// =============================================================================
-// Plugin Implementation
-// =============================================================================
-
-/// How often (in `run()` calls) to re-read the external control file.
-/// The file lives on tmpfs so reads are just page-cache lookups (~1 μs).
-const EXTERNAL_POLL_INTERVAL: u32 = 1;
-
-/// Well-known path inside `$XDG_RUNTIME_DIR` where the media player
-/// writes live control values (strength, model_type) as two little-endian
-/// f32 values (8 bytes total).
-const CONTROL_FILENAME: &str = "gtcrn-ladspa-controls";
-
-// =============================================================================
-// External Controls (shared-file mechanism)
-// =============================================================================
-
-/// Reads live control values from a small file on tmpfs, avoiding the need
-/// to recreate LADSPA instances when the user adjusts the slider.
-struct ExternalControls {
-    path: std::path::PathBuf,
+/// Resolved block-level controls (LADSPA port values mixed with live
+/// values from [`ExternalControls`]).
+struct RuntimeControls {
+    enable: f32,
     strength: f32,
-    model_type: f32,
+    model: f32,
     speech_strength: f32,
     lookahead_ms: f32,
-    model_blend: f32,
+    model_blend: bool,
     voice_recovery: f32,
-    available: bool,
-    counter: u32,
-}
-
-impl ExternalControls {
-    fn new() -> Self {
-        let path = std::env::var("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-            .join(CONTROL_FILENAME);
-
-        let mut ctrl = Self {
-            path,
-            strength: -1.0,
-            model_type: -1.0,
-            speech_strength: -1.0,
-            lookahead_ms: -1.0,
-            model_blend: 1.0,
-            voice_recovery: -1.0,
-            available: false,
-            counter: EXTERNAL_POLL_INTERVAL, // trigger immediate read
-        };
-        ctrl.poll();
-        ctrl
-    }
-
-    /// Test-only constructor with a custom file path.
-    #[cfg(test)]
-    fn with_path(path: std::path::PathBuf) -> Self {
-        Self {
-            path,
-            strength: -1.0,
-            model_type: -1.0,
-            speech_strength: -1.0,
-            lookahead_ms: -1.0,
-            model_blend: 1.0,
-            voice_recovery: -1.0,
-            available: false,
-            counter: EXTERNAL_POLL_INTERVAL,
-        }
-    }
-
-    /// Re-read the control file if enough calls have elapsed.
-    fn poll(&mut self) {
-        self.counter += 1;
-        if self.counter < EXTERNAL_POLL_INTERVAL {
-            return;
-        }
-        self.counter = 0;
-        if let Ok(data) = std::fs::read(&self.path) {
-            // Format v7: 24 bytes (6 floats)
-            // [strength, model, speech_strength, lookahead_ms,
-            //  model_blend, voice_recovery]
-            if data.len() >= 8 {
-                self.strength = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                self.model_type = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                self.available = true;
-            }
-            if data.len() >= 16 {
-                self.speech_strength = f32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                self.lookahead_ms = f32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            }
-            if data.len() >= 24 {
-                self.model_blend = f32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-                self.voice_recovery = f32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-            }
-        }
-    }
 }
 
 // =============================================================================
-// Buffered Frame (for lookahead)
+// Buffered frame (lookahead)
 // =============================================================================
 
-/// Stores a processed STFT frame along with its VAD decision,
-/// enabling look-ahead before choosing the blend strength.
+/// One STFT frame held in the lookahead queue while we decide its blend.
 struct BufferedFrame {
     original: [(f32, f32); NUM_FREQ_BINS],
     enhanced: [(f32, f32); NUM_FREQ_BINS],
-    /// Secondary model output for dual-model blending (VCTK during speech)
+    /// Secondary-model output (VCTK during speech) for dual-model blending.
     enhanced_alt: [(f32, f32); NUM_FREQ_BINS],
-    /// Whether dual-model blending is active for this frame
     dual_model: bool,
     is_speech: bool,
-    /// Original full spectrum (all n_bins) for HF reconstruction.
+    /// Original full spectrum (all `n_bins`) used for HF reconstruction.
     original_full_spectrum: Vec<Complex<f32>>,
 }
 
@@ -177,98 +118,97 @@ struct BufferedFrame {
 // =============================================================================
 
 /// GTCRN LADSPA plugin instance with VAD-driven dual-strength and lookahead.
-///
-/// All processing happens synchronously within `run()`. STFT size adapts
-/// to the host sample rate so no sample-rate conversion is needed.
-///
-/// The ONNX model is lazily initialized on first `run()` call.
 pub struct GtcrnPlugin {
     model: Option<GtcrnModel>,
     second_model: Option<GtcrnModel>,
     stft: StftProcessor,
 
-    /// Host sample rate in Hz
     sample_rate: f32,
-
-    /// Computed once from stft at init.
     nfft: usize,
     hop_size: usize,
 
-    /// Highpass pre-filter (removes sub-80Hz content)
     hp_filter: Biquad,
 
-    /// Sliding analysis window (last nfft samples)
+    /// Sliding analysis window (last `nfft` samples).
     window: Vec<f32>,
-
-    /// Input accumulator (feeds STFT in hop_size chunks)
+    /// Input accumulator (feeds STFT in `hop_size` chunks).
     input_accum: Vec<f32>,
     input_accum_len: usize,
-
-    /// Output accumulator (synthesised samples waiting to be sent)
+    /// Output accumulator (synthesised samples awaiting emission).
     output_accum: Vec<f32>,
     output_accum_len: usize,
 
-    /// Spectrum scratch buffer
     spectrum_buffer: [(f32, f32); NUM_FREQ_BINS],
 
-    /// External control file for live parameter updates
     ext_controls: ExternalControls,
 
-    // -------------------------------------------------------------------------
-    // VAD + Dual-Strength State
-    // -------------------------------------------------------------------------
+    // VAD + lookahead
     vad_gate: f32,
     vad_energy_smooth: f32,
     lookahead_buf: VecDeque<BufferedFrame>,
     lookahead_frames: usize,
 
-    // -------------------------------------------------------------------------
     // Feature state
-    // -------------------------------------------------------------------------
-    /// Model blending — counter for lazy unload
     model_blend_zero_count: usize,
-
-    /// Input normalization: running RMS for boosting quiet audio before model
+    /// Running input RMS for boosting quiet audio before model inference.
     input_norm_rms: f32,
-
-    /// Input-based onset detector: noise floor EMA (energy of input during silence)
+    /// EMA of input energy during silence — feeds onset detection.
     input_noise_floor: f32,
+
+    /// Pre-allocated pool of spectrum buffers for lookahead frames.
+    /// Sized at construction so the audio thread stays allocation-free.
+    spectrum_pool: Vec<Vec<Complex<f32>>>,
+
+    gate: GateState,
 }
 
 impl GtcrnPlugin {
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
     pub fn new(_descriptor: &PluginDescriptor, sample_rate: u64) -> Box<dyn Plugin + Send> {
+        let sr = sample_rate as f32;
         let stft = StftProcessor::new(sample_rate as u32);
         let nfft = stft.nfft();
         let hop_size = stft.hop_size();
-        let hp_filter = Biquad::highpass(HP_CUTOFF_HZ, sample_rate as f32);
+        let hp_filter = Biquad::highpass(HP_CUTOFF_HZ, sr);
+        let n_bins = nfft / 2 + 1;
+        let spectrum_pool: Vec<Vec<Complex<f32>>> = (0..SPECTRUM_POOL_CAPACITY)
+            .map(|_| vec![Complex::new(0.0, 0.0); n_bins])
+            .collect();
+        let input_accum_cap = MAX_HOST_BLOCK + hop_size * 4;
+        let output_accum_cap = MAX_HOST_BLOCK + hop_size * 8;
+
         Box::new(Self {
             model: None,
             second_model: None,
             stft,
-            sample_rate: sample_rate as f32,
+            sample_rate: sr,
             nfft,
             hop_size,
             hp_filter,
             window: vec![0.0; nfft],
-            input_accum: vec![0.0; hop_size * 4],
+            input_accum: vec![0.0; input_accum_cap],
             input_accum_len: 0,
-            output_accum: vec![0.0; hop_size * 8],
+            output_accum: vec![0.0; output_accum_cap],
             output_accum_len: 0,
             spectrum_buffer: [(0.0, 0.0); NUM_FREQ_BINS],
             ext_controls: ExternalControls::new(),
             vad_gate: 0.0,
             vad_energy_smooth: 0.0,
-            lookahead_buf: VecDeque::with_capacity(8),
+            // Sized for the largest practical lookahead (~200 ms / hop ≈ 13 frames).
+            // Avoids growing inside the audio callback when the user pushes
+            // lookahead to its max.
+            lookahead_buf: VecDeque::with_capacity(SPECTRUM_POOL_CAPACITY),
             lookahead_frames: 0,
             model_blend_zero_count: 0,
             input_norm_rms: 0.0,
             input_noise_floor: 0.0,
+            spectrum_pool,
+            gate: GateState::new(sr, MAX_HOST_BLOCK),
         })
     }
 
-    /// Convert milliseconds to STFT frames.
+    /// Convert milliseconds into STFT frames.
     fn ms_to_frames(&self, ms: f32) -> usize {
         if ms <= 0.0 {
             return 0;
@@ -277,327 +217,58 @@ impl GtcrnPlugin {
         (ms / frame_ms).round() as usize
     }
 
-    /// Process complete STFT frames with all NOISE2 feature processing.
-    fn process_frames(&mut self, cfg: &ProcessConfig) {
-        let hop = self.hop_size;
-        let max_frames = self.input_accum_len / hop;
-        self.ensure_output_accum(max_frames * hop);
+    // ---------------------------------------------------------------------
+    // run() helpers
+    // ---------------------------------------------------------------------
 
-        while self.input_accum_len >= hop {
-            // Shift window and add new samples
-            self.window.copy_within(hop.., 0);
-            self.window[self.nfft - hop..].copy_from_slice(&self.input_accum[..hop]);
-            self.input_accum.copy_within(hop..self.input_accum_len, 0);
-            self.input_accum_len -= hop;
-
-            // STFT analysis (already scaled for model)
-            let spectrum = self.stft.analyze(&self.window);
-            self.spectrum_buffer.copy_from_slice(spectrum);
-
-            // Copy spectrum for model input (needed to avoid borrow conflicts)
-            let mut model_input = self.spectrum_buffer;
-
-            // ── Input normalization: boost quiet audio before model ─────
-            // The model was trained on typical speech levels. Quiet audio
-            // has magnitudes too small for the model to distinguish from
-            // noise, causing over-suppression. We normalize to a reference
-            // level before inference and undo after.
-            const NORM_TARGET_RMS: f32 = 0.5;
-            const NORM_MIN_RMS: f32 = 0.02;
-            const NORM_MAX_GAIN: f32 = 3.0;
-            const NORM_EMA: f32 = 0.15;
-
-            let frame_rms = {
-                let mag_sq_sum: f32 = self
-                    .spectrum_buffer
-                    .iter()
-                    .map(|&(re, im)| re * re + im * im)
-                    .sum();
-                (mag_sq_sum / NUM_FREQ_BINS as f32).sqrt()
-            };
-            self.input_norm_rms = if self.input_norm_rms < 1e-6 {
-                frame_rms
-            } else {
-                self.input_norm_rms * (1.0 - NORM_EMA) + frame_rms * NORM_EMA
-            };
-            let norm_gain =
-                if self.input_norm_rms > NORM_MIN_RMS && self.input_norm_rms < NORM_TARGET_RMS {
-                    (NORM_TARGET_RMS / self.input_norm_rms).min(NORM_MAX_GAIN)
-                } else {
-                    1.0
-                };
-            if norm_gain > 1.01 {
-                for bin in &mut model_input {
-                    bin.0 *= norm_gain;
-                    bin.1 *= norm_gain;
-                }
-            }
-
-            // Model inference (always at full power — blend ratio varies)
-            let mut enhanced = match self.model.as_mut() {
-                Some(m) => m.process_frame(&model_input).unwrap_or_else(|e| {
-                    eprintln!("GTCRN model error: {e}");
-                    self.spectrum_buffer
-                }),
-                None => self.spectrum_buffer,
-            };
-
-            // Undo input normalization on model output
-            if norm_gain > 1.01 {
-                let inv_gain = 1.0 / norm_gain;
-                for bin in &mut enhanced {
-                    bin.0 *= inv_gain;
-                    bin.1 *= inv_gain;
-                }
-            }
-
-            // --- Feature 10: Dual-Model Blending ---
-            // When enabled, both DNS3 (restrictive) and VCTK (gentle) run.
-            // DNS3 output is used during silence (better noise gate).
-            // VCTK output is used during speech (preserves voice quality).
-            let mut enhanced_alt = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
-            let dual_model = cfg.model_blend;
-            if dual_model {
-                if let Some(ref mut second) = self.second_model {
-                    enhanced_alt = second
-                        .process_frame(&model_input)
-                        .unwrap_or(self.spectrum_buffer);
-                    // Undo input normalization on second model output
-                    if norm_gain > 1.01 {
-                        let inv_gain = 1.0 / norm_gain;
-                        for bin in &mut enhanced_alt {
-                            bin.0 *= inv_gain;
-                            bin.1 *= inv_gain;
-                        }
-                    }
-                    // Ensure DNS3 is in `enhanced` and VCTK in `enhanced_alt`
-                    let primary_is_dns3 = self
-                        .model
-                        .as_ref()
-                        .map(|m| m.model_type() == ModelType::Dns3)
-                        .unwrap_or(true);
-                    if !primary_is_dns3 {
-                        // Primary is VCTK, secondary is DNS3 — swap so enhanced=DNS3
-                        std::mem::swap(&mut enhanced, &mut enhanced_alt);
-                    }
-                }
-            }
-
-            // Compute VAD from spectral energy ratio with EMA smoothing
-            // Always use DNS3 output (enhanced) for VAD — stronger model = cleaner signal
-            let input_energy: f32 = self
-                .spectrum_buffer
-                .iter()
-                .map(|&(re, im)| re * re + im * im)
-                .sum();
-            let output_energy: f32 = enhanced.iter().map(|&(re, im)| re * re + im * im).sum();
-            let energy_ratio = if input_energy > 1e-10 {
-                output_energy / input_energy
-            } else {
-                0.0
-            };
-
-            const VAD_EMA_ATTACK: f32 = 0.15;
-            self.vad_energy_smooth =
-                self.vad_energy_smooth * (1.0 - VAD_EMA_ATTACK) + energy_ratio * VAD_EMA_ATTACK;
-            const VAD_THRESHOLD: f32 = 0.05;
-            let is_speech = self.vad_energy_smooth > VAD_THRESHOLD;
-
-            // Save original full spectrum for this frame (before synthesize overwrites it)
-            let orig_spectrum = self.stft.original_spectrum().to_vec();
-
-            // Push to lookahead buffer
-            self.lookahead_buf.push_back(BufferedFrame {
-                original: self.spectrum_buffer,
-                enhanced,
-                enhanced_alt,
-                dual_model,
-                is_speech,
-                original_full_spectrum: orig_spectrum,
-            });
-
-            // Emit frames when buffer exceeds lookahead depth
-            while self.lookahead_buf.len() > self.lookahead_frames {
-                let frame = self.lookahead_buf.pop_front().unwrap();
-                let any_future_speech = self.lookahead_buf.iter().any(|f| f.is_speech);
-
-                // ── Input-energy onset detector ────────────────────────
-                // Compute input energy directly from the original spectrum
-                // (independent of model output). This breaks the feedback
-                // loop where model attenuation → low VAD → more suppression.
-                let input_energy: f32 = frame
-                    .original
-                    .iter()
-                    .map(|&(re, im)| re * re + im * im)
-                    .sum();
-
-                // Update noise floor during confirmed silence
-                if self.vad_gate < 0.1 && !frame.is_speech {
-                    const FLOOR_ALPHA: f32 = 0.05;
-                    if self.input_noise_floor < 1e-10 {
-                        self.input_noise_floor = input_energy;
-                    } else {
-                        self.input_noise_floor = self.input_noise_floor * (1.0 - FLOOR_ALPHA)
-                            + input_energy * FLOOR_ALPHA;
-                    }
-                }
-
-                // If input energy is significantly above noise floor,
-                // this is speech onset — force vad_gate high immediately
-                let onset_detected =
-                    self.input_noise_floor > 1e-10 && input_energy > self.input_noise_floor * 4.0;
-
-                // Update VAD gate
-                if frame.is_speech || any_future_speech || onset_detected {
-                    self.vad_gate = 1.0;
-                } else {
-                    self.vad_gate *= VAD_DECAY_COEFF;
-                    if self.vad_gate < 0.01 {
-                        self.vad_gate = 0.0;
-                    }
-                }
-
-                // Effective strength: interpolate between noise and speech strengths
-                let effective_strength = if self.vad_gate > 0.0 {
-                    cfg.noise_strength * (1.0 - self.vad_gate) + cfg.speech_strength * self.vad_gate
-                } else {
-                    cfg.noise_strength
-                };
-
-                // Choose enhanced output: dual-model crossfades DNS3↔VCTK by VAD
-                let chosen_enhanced = if frame.dual_model {
-                    // Crossfade: silence→DNS3 (enhanced), speech→VCTK (enhanced_alt)
-                    let speech_mix = ((self.vad_gate - 0.2) / 0.5).clamp(0.0, 1.0);
-                    if speech_mix <= 0.0 {
-                        frame.enhanced // Pure DNS3 during silence
-                    } else if speech_mix >= 1.0 {
-                        frame.enhanced_alt // Pure VCTK during speech
-                    } else {
-                        let mut mixed = frame.enhanced;
-                        let inv = 1.0 - speech_mix;
-                        for (m, (e, a)) in mixed
-                            .iter_mut()
-                            .zip(frame.enhanced.iter().zip(frame.enhanced_alt.iter()))
-                        {
-                            m.0 = e.0 * inv + a.0 * speech_mix;
-                            m.1 = e.1 * inv + a.1 * speech_mix;
-                        }
-                        mixed
-                    }
-                } else {
-                    frame.enhanced
-                };
-
-                // Blend original and chosen enhanced spectra
-                let blend_strength = effective_strength;
-                let final_spectrum = if blend_strength <= 0.0 {
-                    frame.original
-                } else if blend_strength >= 1.0 {
-                    chosen_enhanced
-                } else {
-                    let mut blended = frame.original;
-                    let inv = 1.0 - blend_strength;
-                    for i in 0..NUM_FREQ_BINS {
-                        blended[i].0 =
-                            frame.original[i].0 * inv + chosen_enhanced[i].0 * blend_strength;
-                        blended[i].1 =
-                            frame.original[i].1 * inv + chosen_enhanced[i].1 * blend_strength;
-                    }
-                    blended
-                };
-
-                // iSTFT synthesis — HighBandProcessor handles HF internally
-                // voice_recovery controls HF reconstruction: 0.0 = cut all HF,
-                // 1.0 = full reconstruction.
-                let synth = self.stft.synthesize(
-                    &final_spectrum,
-                    &frame.original_full_spectrum,
-                    self.vad_gate,
-                    cfg.voice_recovery,
-                );
-                let proc_len = synth.len();
-
-                // Copy to output accumulator
-                let processed_start = self.output_accum_len;
-                self.output_accum[processed_start..processed_start + proc_len]
-                    .copy_from_slice(synth);
-
-                self.output_accum_len += proc_len;
-            }
-        }
-    }
-
-    #[inline]
-    fn ensure_output_accum(&mut self, extra: usize) {
-        let needed = self.output_accum_len + extra;
-        if needed > self.output_accum.len() {
-            self.output_accum.resize(needed + self.hop_size, 0.0);
-        }
-    }
-}
-
-impl Plugin for GtcrnPlugin {
-    fn activate(&mut self) {}
-
-    fn deactivate(&mut self) {}
-
-    fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {
-        let input = ports[PORT_INPUT].unwrap_audio();
-        let mut output = ports[PORT_OUTPUT].unwrap_audio_mut();
-        let enable_control = *ports[PORT_ENABLE].unwrap_control();
-        let strength_control = *ports[PORT_STRENGTH].unwrap_control();
-        let model_control = *ports[PORT_MODEL].unwrap_control();
-        let speech_strength_control = *ports[PORT_SPEECH_STRENGTH].unwrap_control();
-        let lookahead_ms_control = *ports[PORT_LOOKAHEAD_MS].unwrap_control();
-        let model_blend_control = *ports[PORT_MODEL_BLEND].unwrap_control();
-        let voice_recovery_control = *ports[PORT_VOICE_RECOVERY].unwrap_control();
-
-        // Poll external control file for live parameter updates
+    /// Resolve runtime controls — port values overridden by the live
+    /// external-controls file when it's available.
+    fn resolve_controls<'a>(&mut self, ports: &[&'a PortConnection<'a>]) -> RuntimeControls {
         self.ext_controls.poll();
+        let ec_avail = self.ext_controls.available;
 
-        // External file overrides LADSPA port values when available
-        let (strength_val, model_val) = if self.ext_controls.available {
-            (self.ext_controls.strength, self.ext_controls.model_type)
-        } else {
-            (strength_control, model_control)
-        };
-
-        let speech_strength_val =
-            if self.ext_controls.available && self.ext_controls.speech_strength >= 0.0 {
-                self.ext_controls.speech_strength
-            } else {
-                speech_strength_control
-            };
-        let lookahead_ms_val =
-            if self.ext_controls.available && self.ext_controls.lookahead_ms >= 0.0 {
-                self.ext_controls.lookahead_ms
-            } else {
-                lookahead_ms_control
-            };
-        let model_blend_val = if self.ext_controls.available {
-            self.ext_controls.model_blend
-        } else {
-            model_blend_control
-        };
-        let voice_recovery_val =
-            if self.ext_controls.available && self.ext_controls.voice_recovery >= 0.0 {
-                self.ext_controls.voice_recovery
-            } else {
-                voice_recovery_control
-            };
-
-        // Bypass mode: pass through input directly
-        if enable_control < 0.5 || strength_val <= 0.0 {
-            output[..sample_count].copy_from_slice(&input[..sample_count]);
-            return;
+        RuntimeControls {
+            enable: *ports[PORT_ENABLE].unwrap_control(),
+            strength: pick_ext(
+                ec_avail,
+                self.ext_controls.strength,
+                *ports[PORT_STRENGTH].unwrap_control(),
+            ),
+            model: pick_ext(
+                ec_avail,
+                self.ext_controls.model_type,
+                *ports[PORT_MODEL].unwrap_control(),
+            ),
+            speech_strength: pick_ext_nonneg(
+                ec_avail,
+                self.ext_controls.speech_strength,
+                *ports[PORT_SPEECH_STRENGTH].unwrap_control(),
+            ),
+            lookahead_ms: pick_ext_nonneg(
+                ec_avail,
+                self.ext_controls.lookahead_ms,
+                *ports[PORT_LOOKAHEAD_MS].unwrap_control(),
+            ),
+            model_blend: pick_ext(
+                ec_avail,
+                self.ext_controls.model_blend,
+                *ports[PORT_MODEL_BLEND].unwrap_control(),
+            ) >= 0.5,
+            voice_recovery: pick_ext_nonneg(
+                ec_avail,
+                self.ext_controls.voice_recovery,
+                *ports[PORT_VOICE_RECOVERY].unwrap_control(),
+            ),
         }
+    }
 
-        // Update model type if changed (or create on first call)
-        let requested = ModelType::from_control(model_val);
+    /// Ensure the primary model is loaded and matches the requested type.
+    /// On ONNX session failure the model stays `None`; subsequent
+    /// `process_frames` calls degrade gracefully (dry-bypass through the
+    /// scaled spectrum).
+    fn update_primary_model(&mut self, requested: ModelType) {
         match &self.model {
-            None => {
-                self.model = Some(GtcrnModel::new(requested));
-            }
+            None => self.model = GtcrnModel::new(requested),
             Some(m) if m.model_type() != requested => {
                 if let Some(m) = self.model.as_mut() {
                     m.set_model_type(requested);
@@ -605,41 +276,34 @@ impl Plugin for GtcrnPlugin {
             }
             _ => {}
         }
+    }
 
-        // Dual-Model Blending — manage secondary model lifecycle
-        let model_blend = model_blend_val >= 0.5;
+    /// Manage the secondary model lifecycle for dual-model blending.
+    fn update_secondary_model(&mut self, model_blend: bool) {
         if model_blend {
             self.model_blend_zero_count = 0;
             let primary_type = self
                 .model
                 .as_ref()
-                .map(|m| m.model_type())
-                .unwrap_or(ModelType::Dns3);
+                .map_or(ModelType::Dns3, GtcrnModel::model_type);
             let secondary_type = match primary_type {
                 ModelType::Dns3 => ModelType::Vctk,
                 ModelType::Vctk => ModelType::Dns3,
             };
             if self.second_model.is_none() {
-                self.second_model = Some(GtcrnModel::new(secondary_type));
+                self.second_model = GtcrnModel::new(secondary_type);
             }
-        } else {
-            self.model_blend_zero_count += 1;
-            if self.model_blend_zero_count > DUAL_MODEL_UNLOAD_FRAMES && self.second_model.is_some()
-            {
-                self.second_model = None;
-            }
+            return;
         }
-
-        let strength = strength_val.clamp(0.0, 1.0);
-        let speech_strength = speech_strength_val.clamp(0.0, 1.0);
-
-        // Update lookahead if changed
-        let new_la_frames = self.ms_to_frames(lookahead_ms_val.clamp(0.0, 200.0));
-        if new_la_frames != self.lookahead_frames {
-            self.lookahead_frames = new_la_frames;
+        self.model_blend_zero_count += 1;
+        if self.model_blend_zero_count > DUAL_MODEL_UNLOAD_FRAMES && self.second_model.is_some() {
+            self.second_model = None;
         }
+    }
 
-        // Append new input to accumulator (after HP pre-filter)
+    /// Append `input` to the accumulator and run the HP pre-filter on the
+    /// freshly-appended slice.
+    fn feed_input(&mut self, input: &[f32], sample_count: usize) {
         let needed = self.input_accum_len + sample_count;
         if needed > self.input_accum.len() {
             self.input_accum.resize(needed + self.hop_size, 0.0);
@@ -650,45 +314,384 @@ impl Plugin for GtcrnPlugin {
             &mut self.input_accum[self.input_accum_len..self.input_accum_len + sample_count],
         );
         self.input_accum_len += sample_count;
+    }
 
-        // Build process config
-        let cfg = ProcessConfig {
-            noise_strength: strength,
-            speech_strength,
-            model_blend,
-            voice_recovery: voice_recovery_val.clamp(0.0, 1.0),
-        };
-
-        // Process pipeline
-        self.process_frames(&cfg);
-
-        // Copy available output to host buffer
+    /// Drain up to `sample_count` samples from `output_accum` into the host
+    /// buffer; pad with zeros and shift the residual down.
+    fn emit_output(&mut self, output: &mut [f32], sample_count: usize) {
         let available = self.output_accum_len.min(sample_count);
         output[..available].copy_from_slice(&self.output_accum[..available]);
-
         if available < sample_count {
             output[available..sample_count].fill(0.0);
         }
-
         if available > 0 {
             self.output_accum
                 .copy_within(available..self.output_accum_len, 0);
             self.output_accum_len -= available;
         }
     }
+
+    // ---------------------------------------------------------------------
+    // process_frames helpers
+    // ---------------------------------------------------------------------
+
+    fn ensure_output_accum(&mut self, extra: usize) {
+        let needed = self.output_accum_len + extra;
+        if needed > self.output_accum.len() {
+            self.output_accum.resize(needed + self.hop_size, 0.0);
+        }
+    }
+
+    /// Slide the analysis window forward by `hop_size`, refilling from
+    /// `input_accum`. Caller must ensure `input_accum_len >= hop_size`.
+    fn shift_window(&mut self) {
+        let hop = self.hop_size;
+        self.window.copy_within(hop.., 0);
+        self.window[self.nfft - hop..].copy_from_slice(&self.input_accum[..hop]);
+        self.input_accum.copy_within(hop..self.input_accum_len, 0);
+        self.input_accum_len -= hop;
+    }
+
+    /// Compute the input-normalisation gain for this frame and update the
+    /// running RMS estimate. Returns `1.0` when no boost should apply.
+    fn compute_norm_gain(&mut self) -> f32 {
+        let mag_sq_sum: f32 = self
+            .spectrum_buffer
+            .iter()
+            .map(|&(re, im)| re * re + im * im)
+            .sum();
+        let frame_rms = (mag_sq_sum / NUM_FREQ_BINS as f32).sqrt();
+        self.input_norm_rms = if self.input_norm_rms < 1e-6 {
+            frame_rms
+        } else {
+            self.input_norm_rms * (1.0 - NORM_EMA) + frame_rms * NORM_EMA
+        };
+        if self.input_norm_rms > NORM_MIN_RMS && self.input_norm_rms < NORM_TARGET_RMS {
+            (NORM_TARGET_RMS / self.input_norm_rms).min(NORM_MAX_GAIN)
+        } else {
+            1.0
+        }
+    }
+
+    /// Run the primary model on `model_input`. On error the original
+    /// scaled spectrum is returned — the audio path stays alive.
+    fn run_primary(
+        &mut self,
+        model_input: &[(f32, f32); NUM_FREQ_BINS],
+    ) -> [(f32, f32); NUM_FREQ_BINS] {
+        match self.model.as_mut() {
+            Some(m) => m.process_frame(model_input).unwrap_or(self.spectrum_buffer),
+            None => self.spectrum_buffer,
+        }
+    }
+
+    /// Run the secondary model when dual-model blending is on; ensures
+    /// `enhanced` ends up as the DNS3 output and `enhanced_alt` as VCTK.
+    fn run_secondary(
+        &mut self,
+        model_input: &[(f32, f32); NUM_FREQ_BINS],
+        enhanced: &mut [(f32, f32); NUM_FREQ_BINS],
+        norm_gain: f32,
+    ) -> [(f32, f32); NUM_FREQ_BINS] {
+        let mut enhanced_alt = [(0.0_f32, 0.0_f32); NUM_FREQ_BINS];
+        let Some(second) = self.second_model.as_mut() else {
+            return enhanced_alt;
+        };
+        enhanced_alt = second
+            .process_frame(model_input)
+            .unwrap_or(self.spectrum_buffer);
+        if norm_gain > 1.01 {
+            apply_gain(&mut enhanced_alt, 1.0 / norm_gain);
+        }
+        let primary_is_dns3 = self
+            .model
+            .as_ref()
+            .is_none_or(|m| m.model_type() == ModelType::Dns3);
+        if !primary_is_dns3 {
+            std::mem::swap(enhanced, &mut enhanced_alt);
+        }
+        enhanced_alt
+    }
+
+    /// Per-frame VAD decision combining DNS3 (energy ratio) or VCTK
+    /// (input vs. noise floor) flavours, depending on which model is in
+    /// `enhanced`.
+    fn frame_vad(
+        &mut self,
+        input_energy: f32,
+        enhanced: &[(f32, f32); NUM_FREQ_BINS],
+        dual_model: bool,
+    ) -> bool {
+        let primary_is_dns3 = dual_model
+            || self
+                .model
+                .as_ref()
+                .is_none_or(|m| m.model_type() == ModelType::Dns3);
+        if primary_is_dns3 {
+            let output_energy = spectrum_energy(enhanced);
+            let (is_speech, ema) =
+                dns3_energy_ratio_vad(input_energy, output_energy, self.vad_energy_smooth);
+            self.vad_energy_smooth = ema;
+            is_speech
+        } else {
+            vctk_input_only_vad(input_energy, self.input_noise_floor)
+        }
+    }
+
+    /// Borrow a spectrum-shaped buffer from the pool; allocates only when
+    /// the pool is exhausted (sizing should keep this off the audio thread).
+    fn pop_pool_buffer(&mut self, len: usize) -> Vec<Complex<f32>> {
+        let mut buf = self
+            .spectrum_pool
+            .pop()
+            .unwrap_or_else(|| vec![Complex::new(0.0, 0.0); len]);
+        buf.resize(len, Complex::new(0.0, 0.0));
+        buf
+    }
+
+    /// Mix the dual-model outputs with the VAD-driven crossfade.
+    /// `frame.enhanced` is DNS3 (silence side), `enhanced_alt` is VCTK
+    /// (speech side).
+    fn mix_dual_model(&self, frame: &BufferedFrame) -> [(f32, f32); NUM_FREQ_BINS] {
+        if !frame.dual_model {
+            return frame.enhanced;
+        }
+        let speech_mix = ((self.vad_gate - 0.2) / 0.5).clamp(0.0, 1.0);
+        if speech_mix <= 0.0 {
+            return frame.enhanced;
+        }
+        if speech_mix >= 1.0 {
+            return frame.enhanced_alt;
+        }
+        let mut mixed = frame.enhanced;
+        let inv = 1.0 - speech_mix;
+        for (m, (e, a)) in mixed
+            .iter_mut()
+            .zip(frame.enhanced.iter().zip(frame.enhanced_alt.iter()))
+        {
+            m.0 = e.0 * inv + a.0 * speech_mix;
+            m.1 = e.1 * inv + a.1 * speech_mix;
+        }
+        mixed
+    }
+
+    /// Process one analysis frame: STFT → models → push to lookahead queue.
+    fn analyse_one_frame(&mut self, cfg: &ProcessConfig) {
+        self.shift_window();
+        let spectrum = self.stft.analyze(&self.window);
+        self.spectrum_buffer.copy_from_slice(spectrum);
+
+        let mut model_input = self.spectrum_buffer;
+        let norm_gain = self.compute_norm_gain();
+        if norm_gain > 1.01 {
+            apply_gain(&mut model_input, norm_gain);
+        }
+
+        let mut enhanced = self.run_primary(&model_input);
+        if norm_gain > 1.01 {
+            apply_gain(&mut enhanced, 1.0 / norm_gain);
+        }
+
+        let dual_model = cfg.model_blend;
+        let enhanced_alt = if dual_model {
+            self.run_secondary(&model_input, &mut enhanced, norm_gain)
+        } else {
+            [(0.0_f32, 0.0_f32); NUM_FREQ_BINS]
+        };
+
+        let input_energy = spectrum_energy(&self.spectrum_buffer);
+        let is_speech = self.frame_vad(input_energy, &enhanced, dual_model);
+
+        let orig_len = self.stft.original_spectrum().len();
+        let mut orig_spectrum = self.pop_pool_buffer(orig_len);
+        orig_spectrum.copy_from_slice(self.stft.original_spectrum());
+
+        self.lookahead_buf.push_back(BufferedFrame {
+            original: self.spectrum_buffer,
+            enhanced,
+            enhanced_alt,
+            dual_model,
+            is_speech,
+            original_full_spectrum: orig_spectrum,
+        });
+    }
+
+    /// Pop the oldest lookahead frame, run VAD-gate update + onset
+    /// detector + dual-model mix + iSTFT, append to `output_accum`.
+    fn emit_one_frame(&mut self, cfg: &ProcessConfig) {
+        let Some(frame) = self.lookahead_buf.pop_front() else {
+            return;
+        };
+        let any_future_speech = self.lookahead_buf.iter().any(|f| f.is_speech);
+        let input_energy = spectrum_energy(&frame.original);
+
+        update_noise_floor(
+            &mut self.input_noise_floor,
+            input_energy,
+            self.vad_gate,
+            frame.is_speech,
+        );
+        let onset = detect_onset(input_energy, self.input_noise_floor);
+        step_vad_gate(
+            &mut self.vad_gate,
+            &mut self.vad_energy_smooth,
+            frame.is_speech,
+            any_future_speech,
+            onset,
+        );
+
+        let strength = effective_strength(cfg.noise_strength, cfg.speech_strength, self.vad_gate);
+        let chosen_enhanced = self.mix_dual_model(&frame);
+        let final_spectrum = blend_strength(&frame.original, &chosen_enhanced, strength);
+
+        let synth = self.stft.synthesize(
+            &final_spectrum,
+            &frame.original_full_spectrum,
+            self.vad_gate,
+            cfg.voice_recovery,
+        );
+        let proc_len = synth.len();
+        let processed_start = self.output_accum_len;
+        self.output_accum[processed_start..processed_start + proc_len].copy_from_slice(synth);
+        self.output_accum_len += proc_len;
+
+        // Cap pool growth so a brief lookahead spike doesn't permanently
+        // inflate memory. Drop the buffer past the cap.
+        if self.spectrum_pool.len() < SPECTRUM_POOL_CAPACITY {
+            self.spectrum_pool.push(frame.original_full_spectrum);
+        }
+    }
+
+    /// Drive the STFT loop: consume `input_accum` in `hop_size` chunks,
+    /// run analysis + model + emission for each whole frame.
+    fn process_frames(&mut self, cfg: &ProcessConfig) {
+        let hop = self.hop_size;
+        let max_frames = self.input_accum_len / hop;
+        self.ensure_output_accum(max_frames * hop);
+
+        while self.input_accum_len >= hop {
+            self.analyse_one_frame(cfg);
+            while self.lookahead_buf.len() > self.lookahead_frames {
+                self.emit_one_frame(cfg);
+            }
+        }
+    }
 }
+
+// =============================================================================
+// Free helpers
+// =============================================================================
+
+fn pick_ext(available: bool, ext: f32, port: f32) -> f32 {
+    if available {
+        ext
+    } else {
+        port
+    }
+}
+
+fn pick_ext_nonneg(available: bool, ext: f32, port: f32) -> f32 {
+    if available && ext >= 0.0 {
+        ext
+    } else {
+        port
+    }
+}
+
+#[inline]
+fn apply_gain(spectrum: &mut [(f32, f32); NUM_FREQ_BINS], gain: f32) {
+    for bin in spectrum.iter_mut() {
+        bin.0 *= gain;
+        bin.1 *= gain;
+    }
+}
+
+/// Linear-blend `original` and `enhanced` by `strength` (0 = original,
+/// 1 = enhanced).
+fn blend_strength(
+    original: &[(f32, f32); NUM_FREQ_BINS],
+    enhanced: &[(f32, f32); NUM_FREQ_BINS],
+    strength: f32,
+) -> [(f32, f32); NUM_FREQ_BINS] {
+    if strength <= 0.0 {
+        return *original;
+    }
+    if strength >= 1.0 {
+        return *enhanced;
+    }
+    let mut blended = *original;
+    let inv = 1.0 - strength;
+    for i in 0..NUM_FREQ_BINS {
+        blended[i].0 = original[i].0 * inv + enhanced[i].0 * strength;
+        blended[i].1 = original[i].1 * inv + enhanced[i].1 * strength;
+    }
+    blended
+}
+
+// =============================================================================
+// LADSPA Plugin trait impl
+// =============================================================================
+
+impl Plugin for GtcrnPlugin {
+    fn activate(&mut self) {}
+
+    fn deactivate(&mut self) {}
+
+    fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {
+        let input = ports[PORT_INPUT].unwrap_audio();
+        let mut output = ports[PORT_OUTPUT].unwrap_audio_mut();
+
+        let controls = self.resolve_controls(ports);
+
+        // Bypass: enable off OR strength at zero.
+        if controls.enable < 0.5 || controls.strength <= 0.0 {
+            output[..sample_count].copy_from_slice(&input[..sample_count]);
+            return;
+        }
+
+        let requested = ModelType::from_control(controls.model);
+        self.update_primary_model(requested);
+        self.update_secondary_model(controls.model_blend);
+
+        let strength = controls.strength.clamp(0.0, 1.0);
+        let speech_strength = controls.speech_strength.clamp(0.0, 1.0);
+        let new_la = self.ms_to_frames(controls.lookahead_ms.clamp(0.0, 200.0));
+        if new_la != self.lookahead_frames {
+            self.lookahead_frames = new_la;
+        }
+
+        self.feed_input(input, sample_count);
+
+        let cfg = ProcessConfig {
+            noise_strength: strength,
+            speech_strength,
+            model_blend: controls.model_blend,
+            voice_recovery: controls.voice_recovery.clamp(0.0, 1.0),
+        };
+        self.process_frames(&cfg);
+        self.emit_output(&mut output, sample_count);
+
+        apply_gate_pass(
+            &mut self.gate,
+            self.sample_rate,
+            self.vad_gate,
+            input,
+            &mut output,
+            sample_count,
+            ports,
+        );
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
-    // =========================================================================
-    // ms_to_frames
-    // =========================================================================
-
-    /// Helper: compute ms_to_frames with given hop_size and sample_rate
-    fn ms_to_frames(hop_size: usize, sample_rate: f32, ms: f32) -> usize {
+    fn ms_to_frames_calc(hop_size: usize, sample_rate: f32, ms: f32) -> usize {
         if ms <= 0.0 {
             return 0;
         }
@@ -698,18 +701,17 @@ mod tests {
 
     #[test]
     fn ms_to_frames_48khz() {
-        // At 48 kHz, hop=768 → frame_ms ≈ 16 ms
-        assert_eq!(ms_to_frames(768, 48000.0, 0.0), 0);
-        assert_eq!(ms_to_frames(768, 48000.0, 16.0), 1);
-        assert_eq!(ms_to_frames(768, 48000.0, 50.0), 3);
-        assert_eq!(ms_to_frames(768, 48000.0, 200.0), 13); // 200 / 16 = 12.5 → 13
+        // At 48 kHz, hop=768 → frame_ms ≈ 16 ms.
+        assert_eq!(ms_to_frames_calc(768, 48000.0, 0.0), 0);
+        assert_eq!(ms_to_frames_calc(768, 48000.0, 16.0), 1);
+        assert_eq!(ms_to_frames_calc(768, 48000.0, 50.0), 3);
+        assert_eq!(ms_to_frames_calc(768, 48000.0, 200.0), 13);
     }
 
     #[test]
     fn ms_to_frames_44100() {
-        // At 44.1 kHz, nfft=1412, hop=706 → frame_ms ≈ 16.01 ms
-        assert_eq!(ms_to_frames(706, 44100.0, 0.0), 0);
-        let frames_50 = ms_to_frames(706, 44100.0, 50.0);
+        assert_eq!(ms_to_frames_calc(706, 44100.0, 0.0), 0);
+        let frames_50 = ms_to_frames_calc(706, 44100.0, 50.0);
         assert!(
             frames_50 == 3 || frames_50 == 4,
             "expected 3 or 4, got {frames_50}"
@@ -718,135 +720,66 @@ mod tests {
 
     #[test]
     fn ms_to_frames_negative() {
-        assert_eq!(ms_to_frames(768, 48000.0, -10.0), 0);
+        assert_eq!(ms_to_frames_calc(768, 48000.0, -10.0), 0);
     }
 
     #[test]
     fn ms_to_frames_96khz() {
-        // At 96 kHz, hop=1536 → frame_ms = 16 ms (same as 48k due to proportional scaling)
-        assert_eq!(ms_to_frames(1536, 96000.0, 50.0), 3);
-    }
-
-    // =========================================================================
-    // ExternalControls::poll — byte format parsing
-    // =========================================================================
-
-    fn write_control_file(path: &std::path::Path, data: &[u8]) {
-        let mut file = std::fs::File::create(path).expect("create control file");
-        file.write_all(data).expect("write control file");
+        assert_eq!(ms_to_frames_calc(1536, 96000.0, 50.0), 3);
     }
 
     #[test]
-    fn poll_v2_format_8_bytes() {
-        let dir = tempdir();
-        let path = dir.join("controls");
-        let strength: f32 = 0.75;
-        let model: f32 = 1.0;
-        let mut data = Vec::new();
-        data.extend_from_slice(&strength.to_le_bytes());
-        data.extend_from_slice(&model.to_le_bytes());
-        write_control_file(&path, &data);
-
-        let mut ctrl = ExternalControls::with_path(path);
-        ctrl.poll();
-        assert!(ctrl.available);
-        assert!((ctrl.strength - 0.75).abs() < 1e-6);
-        assert!((ctrl.model_type - 1.0).abs() < 1e-6);
-        // Extended fields remain at defaults
-        assert_eq!(ctrl.speech_strength, -1.0);
-        std::fs::remove_dir_all(&dir).ok();
+    fn pick_ext_uses_external_when_available() {
+        assert!((pick_ext(true, 0.7, 0.0) - 0.7).abs() < 1e-6);
+        assert!((pick_ext(false, 0.7, 0.0) - 0.0).abs() < 1e-6);
     }
 
     #[test]
-    fn poll_v4_format_16_bytes() {
-        let dir = tempdir();
-        let path = dir.join("controls");
-        let vals: [f32; 4] = [0.5, 0.0, 0.8, 100.0];
-        let mut data = Vec::new();
-        for v in &vals {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        write_control_file(&path, &data);
-
-        let mut ctrl = ExternalControls::with_path(path);
-        ctrl.poll();
-        assert!(ctrl.available);
-        assert!((ctrl.strength - 0.5).abs() < 1e-6);
-        assert!((ctrl.model_type - 0.0).abs() < 1e-6);
-        assert!((ctrl.speech_strength - 0.8).abs() < 1e-6);
-        assert!((ctrl.lookahead_ms - 100.0).abs() < 1e-6);
-        std::fs::remove_dir_all(&dir).ok();
+    fn pick_ext_nonneg_falls_back_for_sentinel() {
+        assert!((pick_ext_nonneg(true, -1.0, 0.5) - 0.5).abs() < 1e-6);
+        assert!((pick_ext_nonneg(true, 0.3, 0.5) - 0.3).abs() < 1e-6);
+        assert!((pick_ext_nonneg(false, 0.3, 0.5) - 0.5).abs() < 1e-6);
     }
 
     #[test]
-    fn poll_v7_format_24_bytes() {
-        let dir = tempdir();
-        let path = dir.join("controls");
-        let vals: [f32; 6] = [0.9, 0.0, 1.0, 50.0, 0.5, 0.0];
-        let mut data = Vec::new();
-        for v in &vals {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        write_control_file(&path, &data);
-
-        let mut ctrl = ExternalControls::with_path(path);
-        ctrl.poll();
-        assert!(ctrl.available);
-        assert!((ctrl.strength - 0.9).abs() < 1e-6);
-        assert!((ctrl.model_type - 0.0).abs() < 1e-6);
-        assert!((ctrl.speech_strength - 1.0).abs() < 1e-6);
-        assert!((ctrl.lookahead_ms - 50.0).abs() < 1e-6);
-        assert!((ctrl.voice_enhance - 0.5).abs() < 1e-6);
-        assert!((ctrl.model_blend - 0.0).abs() < 1e-6);
-        std::fs::remove_dir_all(&dir).ok();
+    fn blend_strength_endpoints_no_alloc() {
+        let orig = [(1.0, 2.0); NUM_FREQ_BINS];
+        let enh = [(3.0, 4.0); NUM_FREQ_BINS];
+        let zero = blend_strength(&orig, &enh, 0.0);
+        let one = blend_strength(&orig, &enh, 1.0);
+        assert!((zero[0].0 - 1.0).abs() < 1e-6);
+        assert!((one[0].0 - 3.0).abs() < 1e-6);
     }
 
     #[test]
-    fn poll_missing_file() {
-        let path = std::path::PathBuf::from("/tmp/gtcrn-test-nonexistent-12345");
-        let mut ctrl = ExternalControls::with_path(path);
-        ctrl.poll();
-        assert!(!ctrl.available);
+    fn blend_strength_midpoint() {
+        let orig = [(0.0, 0.0); NUM_FREQ_BINS];
+        let enh = [(2.0, 4.0); NUM_FREQ_BINS];
+        let mid = blend_strength(&orig, &enh, 0.5);
+        assert!((mid[0].0 - 1.0).abs() < 1e-6);
+        assert!((mid[0].1 - 2.0).abs() < 1e-6);
     }
 
     #[test]
-    fn poll_short_file_ignored() {
-        let dir = tempdir();
-        let path = dir.join("controls");
-        write_control_file(&path, &[0u8; 4]); // Only 4 bytes — not enough
-
-        let mut ctrl = ExternalControls::with_path(path);
-        ctrl.poll();
-        assert!(!ctrl.available); // 4 bytes < 8, so not parsed
-        std::fs::remove_dir_all(&dir).ok();
+    fn apply_gain_scales_in_place() {
+        let mut s = [(1.0, 2.0); NUM_FREQ_BINS];
+        apply_gain(&mut s, 2.0);
+        assert!((s[0].0 - 2.0).abs() < 1e-6);
+        assert!((s[0].1 - 4.0).abs() < 1e-6);
     }
-
-    // =========================================================================
-    // Constants sanity checks
-    // =========================================================================
 
     #[test]
-    fn constants_sane() {
-        const {
-            assert!(HP_CUTOFF_HZ > 0.0);
-            assert!(VAD_DECAY_COEFF > 0.0 && VAD_DECAY_COEFF < 1.0);
-            assert!(MAX_GAIN_COMP_RATIO > 1.0);
-            assert!(MAX_DEESS_REDUCTION > 0.0 && MAX_DEESS_REDUCTION < 1.0);
-            assert!(DEESS_CENTER_BIN > 0.0);
-            assert!(DEESS_WIDTH_BINS > 0.0);
-            assert!(SMOOTHING_FLOOR_FACTOR > 0.0 && SMOOTHING_FLOOR_FACTOR < 1.0);
-            assert!(DUAL_MODEL_UNLOAD_FRAMES > 0);
-        }
+    fn buffers_pre_sized_for_max_block() {
+        // The largest practical host block we expect; constructor must
+        // size the input/output accumulators above this so a typical
+        // run() never reallocates.
+        const { assert!(MAX_HOST_BLOCK >= 16 * 1024) };
     }
 
-    /// Create a temporary directory for test files.
-    fn tempdir() -> std::path::PathBuf {
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("gtcrn-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    #[test]
+    fn spectrum_pool_capacity_is_generous() {
+        // Lookahead tops out near 200 ms / 16 ms ≈ 13 frames; the pool
+        // must hold significantly more than that to absorb bursts.
+        const { assert!(SPECTRUM_POOL_CAPACITY >= 16) };
     }
 }

@@ -2,7 +2,7 @@
 # GTCRN LADSPA ORT Build Script
 # Supports dynamic (system), static (downloaded MS), and minimal (docker) strategies.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"

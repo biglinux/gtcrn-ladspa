@@ -49,13 +49,13 @@ const ONSET_COOLDOWN_FRAMES: usize = 30;
 /// signals actually trigger the reset.
 const SUPPRESS_TRIGGER_RATIO: f32 = 0.002;
 
-/// Multiplier over energy_avg that input must exceed for the
+/// Multiplier over `energy_avg` that input must exceed for the
 /// suppression trigger. 6× ensures only speech-level signals trigger
 /// (well above noise transient variations).
 const SUPPRESS_INPUT_FACTOR: f32 = 6.0;
 
 /// Minimum number of frames processed before onset detection activates.
-/// Prevents false triggers during the first seconds when energy_avg is
+/// Prevents false triggers during the first seconds when `energy_avg` is
 /// still calibrating from near-zero warm-up values.
 /// 300 frames × 16 ms ≈ 5 seconds.
 const ONSET_MIN_FRAMES: usize = 300;
@@ -167,20 +167,24 @@ pub struct GtcrnModel {
     energy_avg: f32,
     /// Cooldown counter: while > 0, onset detection is inhibited.
     onset_cooldown: usize,
-    /// Total frames processed; onset detection only activates after ONSET_MIN_FRAMES.
+    /// Total frames processed; onset detection only activates after `ONSET_MIN_FRAMES`.
     frame_count: usize,
     /// True if previous frame's output was heavily suppressed (ratio < threshold).
     prev_over_suppressed: bool,
 }
 
 impl GtcrnModel {
+    /// Build a session-backed model. Returns `None` if ONNX Runtime fails
+    /// to instantiate (missing shared library, OOM, malformed model). The
+    /// LADSPA host loads us via FFI, so we never panic across the boundary —
+    /// the caller falls back to dry-bypass when this returns `None`.
     #[must_use]
-    pub fn new(model_type: ModelType) -> Self {
+    pub fn new(model_type: ModelType) -> Option<Self> {
         let model_bytes = match model_type {
             ModelType::Dns3 => EMBEDDED_MODEL_DNS3,
             ModelType::Vctk => EMBEDDED_MODEL_VCTK,
         };
-        let session = create_session(model_bytes).expect("Failed to create ONNX session");
+        let session = create_session(model_bytes).ok()?;
         let mut m = Self {
             model_type,
             state: GtcrnState::new(),
@@ -192,7 +196,7 @@ impl GtcrnModel {
         };
         m.warm_up();
         m.state.capture_reference();
-        m
+        Some(m)
     }
 
     #[must_use]
@@ -201,30 +205,28 @@ impl GtcrnModel {
     }
 
     pub fn set_model_type(&mut self, model_type: ModelType) {
-        if self.model_type != model_type {
-            let model_bytes = match model_type {
-                ModelType::Dns3 => EMBEDDED_MODEL_DNS3,
-                ModelType::Vctk => EMBEDDED_MODEL_VCTK,
-            };
-            match create_session(model_bytes) {
-                Ok(new_session) => {
-                    self.session = new_session;
-                    self.model_type = model_type;
-                    self.state.reset();
-                    self.warm_up();
-                    self.state.capture_reference();
-                }
-                Err(e) => {
-                    eprintln!("GTCRN: Failed to switch model: {e}");
-                }
-            }
+        if self.model_type == model_type {
+            return;
+        }
+        let model_bytes = match model_type {
+            ModelType::Dns3 => EMBEDDED_MODEL_DNS3,
+            ModelType::Vctk => EMBEDDED_MODEL_VCTK,
+        };
+        // Silent failure on switch: keep the previous session alive so audio
+        // keeps flowing. The next switch attempt may succeed.
+        if let Ok(new_session) = create_session(model_bytes) {
+            self.session = new_session;
+            self.model_type = model_type;
+            self.state.reset();
+            self.warm_up();
+            self.state.capture_reference();
         }
     }
 
     /// Feed synthetic low-energy spectrum frames to bring recurrent state
     /// away from the over-suppressive all-zeros initialization.
     fn warm_up(&mut self) {
-        let mut spectrum = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
+        let mut spectrum = [(0.0_f32, 0.0_f32); NUM_FREQ_BINS];
         // Deterministic low-energy "pink-ish" noise spectrum
         for (i, pair) in spectrum.iter_mut().enumerate() {
             let f = (i as f32 + 1.0) / NUM_FREQ_BINS as f32;
@@ -236,6 +238,13 @@ impl GtcrnModel {
         }
     }
 
+    /// Runs one analysis frame through the ONNX session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ORT session fails to execute or its output
+    /// shape no longer matches `[1, 257, 1, 2]` — both indicate a corrupted
+    /// or mis-converted model and are non-recoverable on the audio thread.
     pub fn process_frame(
         &mut self,
         spectrum: &[(f32, f32); NUM_FREQ_BINS],
@@ -266,13 +275,15 @@ impl GtcrnModel {
             self.state.input_buf[i * 2 + 1] = im;
         }
 
-        let input_tensor =
-            TensorRef::from_array_view(([1usize, NUM_FREQ_BINS, 1, 2], &self.state.input_buf[..]))?;
+        let input_tensor = TensorRef::from_array_view((
+            [1_usize, NUM_FREQ_BINS, 1, 2],
+            &self.state.input_buf[..],
+        ))?;
         let conv_tensor =
-            TensorRef::from_array_view(([2usize, 1, 16, 16, 33], &self.state.conv[..]))?;
-        let tra_tensor = TensorRef::from_array_view(([2usize, 3, 1, 1, 16], &self.state.tra[..]))?;
+            TensorRef::from_array_view(([2_usize, 1, 16, 16, 33], &self.state.conv[..]))?;
+        let tra_tensor = TensorRef::from_array_view(([2_usize, 3, 1, 1, 16], &self.state.tra[..]))?;
         let inter_tensor =
-            TensorRef::from_array_view(([2usize, 1, 33, 16], &self.state.inter[..]))?;
+            TensorRef::from_array_view(([2_usize, 1, 33, 16], &self.state.inter[..]))?;
 
         let outputs = self.session.run(ort::inputs![
             input_tensor,
@@ -334,19 +345,20 @@ mod tests {
 
     #[test]
     fn create_model_dns3() {
-        let model = GtcrnModel::new(ModelType::Dns3);
+        let model = GtcrnModel::new(ModelType::Dns3).expect("ONNX session should build in test");
         assert_eq!(model.model_type(), ModelType::Dns3);
     }
 
     #[test]
     fn create_model_vctk() {
-        let model = GtcrnModel::new(ModelType::Vctk);
+        let model = GtcrnModel::new(ModelType::Vctk).expect("ONNX session should build in test");
         assert_eq!(model.model_type(), ModelType::Vctk);
     }
 
     #[test]
     fn model_type_switch() {
-        let mut model = GtcrnModel::new(ModelType::Dns3);
+        let mut model =
+            GtcrnModel::new(ModelType::Dns3).expect("ONNX session should build in test");
         assert_eq!(model.model_type(), ModelType::Dns3);
         model.set_model_type(ModelType::Vctk);
         assert_eq!(model.model_type(), ModelType::Vctk);
@@ -354,8 +366,9 @@ mod tests {
 
     #[test]
     fn process_frame_returns_correct_size() {
-        let mut model = GtcrnModel::new(ModelType::Dns3);
-        let input = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
+        let mut model =
+            GtcrnModel::new(ModelType::Dns3).expect("ONNX session should build in test");
+        let input = [(0.0_f32, 0.0_f32); NUM_FREQ_BINS];
         let output = model
             .process_frame(&input)
             .expect("inference should succeed");
@@ -364,8 +377,9 @@ mod tests {
 
     #[test]
     fn process_frame_silence_passthrough() {
-        let mut model = GtcrnModel::new(ModelType::Dns3);
-        let silence = [(0.0f32, 0.0f32); NUM_FREQ_BINS];
+        let mut model =
+            GtcrnModel::new(ModelType::Dns3).expect("ONNX session should build in test");
+        let silence = [(0.0_f32, 0.0_f32); NUM_FREQ_BINS];
         let output = model
             .process_frame(&silence)
             .expect("inference should succeed");

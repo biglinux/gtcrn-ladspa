@@ -1,4 +1,7 @@
-// Build script for static linking of minimal ONNX Runtime
+// Build script:
+//   1. Convert embedded ONNX models to .ort (every build).
+//   2. For the `static` feature only, link the bundled minimal ONNX
+//      Runtime + Abseil archives produced by build-minimal-docker.sh.
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -6,10 +9,8 @@ use std::path::PathBuf;
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-    // Enable model conversion feature by default or strictly for this build
     convert_models(&manifest_dir);
 
-    // Only run this for the 'static' feature
     if !cfg!(feature = "static") {
         return;
     }
@@ -18,28 +19,30 @@ fn main() {
         .join("onnxruntime-minimal")
         .join("lib");
 
-    if !lib_dir.exists() {
-        panic!(
-            "Static ONNX Runtime libraries not found at {:?}. Run ./build-minimal-docker.sh first.",
-            lib_dir
-        );
-    }
+    assert!(
+        lib_dir.exists(),
+        "Static ONNX Runtime libraries not found at {}. Run ./build-minimal-docker.sh first.",
+        lib_dir.display()
+    );
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
-    // Link the unified libonnxruntime.a composed by build.sh
-    // We use +whole-archive to ensure symbols like OrtGetApiBase are included
-    // even if not directly referenced by Rust code (required for ort crate initialization)
+    // Link the unified libonnxruntime.a composed by build.sh.
+    // `+whole-archive` ensures symbols like OrtGetApiBase are included even
+    // when not referenced by Rust (the ort crate initialises them lazily).
     println!("cargo:rustc-link-lib=static:+whole-archive=onnxruntime");
 
-    // Auto-discover and link Abseil libraries (libabsl_*.a)
-    // We sort them to ensure deterministic build order, though cyclic deps might require groups.
+    // Auto-discover and link Abseil libraries (libabsl_*.a). Sort for a
+    // deterministic build order; cyclic deps may need link groups instead.
     let mut absl_libs = Vec::new();
     if let Ok(entries) = fs::read_dir(&lib_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().into_string().unwrap();
-            if name.starts_with("libabsl_") && name.ends_with(".a") {
-                let lib_name = &name[3..name.len() - 2]; // remove "lib" and ".a"
+            let is_static_lib = std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("a"));
+            if name.starts_with("libabsl_") && is_static_lib {
+                let lib_name = &name[3..name.len() - 2]; // strip "lib" prefix + ".a" suffix
                 absl_libs.push(lib_name.to_string());
             }
         }
@@ -47,11 +50,10 @@ fn main() {
     absl_libs.sort();
 
     for lib in absl_libs {
-        println!("cargo:rustc-link-lib=static={}", lib);
+        println!("cargo:rustc-link-lib=static={lib}");
     }
 
-    // Link other dependencies found in the dir
-    // We check existence to be safe
+    // Link other static deps that build-minimal-docker.sh emits.
     let deps = [
         "protobuf",
         "protobuf-lite",
@@ -60,22 +62,20 @@ fn main() {
         "flatbuffers",
     ];
     for dep in deps {
-        let filename = format!("lib{}.a", dep);
+        let filename = format!("lib{dep}.a");
         if lib_dir.join(&filename).exists() {
-            println!("cargo:rustc-link-lib=static={}", dep);
+            println!("cargo:rustc-link-lib=static={dep}");
         }
     }
 
-    // Link system libraries
+    // System libraries pulled in by the static archives.
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=dl");
-    println!("cargo:rustc-link-lib=stdc++"); // Important for C++ runtime
+    println!("cargo:rustc-link-lib=stdc++");
 }
 
 fn convert_models(manifest_dir: &str) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // Define models to process: (source_name, output_name)
-    // Source path is relative to manifest_dir + ../stream/onnx_models
     let models = [
         ("gtcrn_simple.onnx", "gtcrn_simple.ort"),
         ("gtcrn_vctk.onnx", "gtcrn_vctk.ort"),
@@ -86,10 +86,20 @@ fn convert_models(manifest_dir: &str) {
         .unwrap()
         .join("stream")
         .join("onnx_models");
-    let python_path = PathBuf::from(manifest_dir).join(".venv/bin/python");
+    // GTCRN_PYTHON env var lets packagers (PKGBUILD) point at a system
+    // python without patching this file. Default keeps the local .venv flow.
+    println!("cargo:rerun-if-env-changed=GTCRN_PYTHON");
+    let python_path = env::var_os("GTCRN_PYTHON").map_or_else(
+        || PathBuf::from(manifest_dir).join(".venv/bin/python"),
+        PathBuf::from,
+    );
 
-    if !python_path.exists() {
-        println!("cargo:warning=Python venv not found at {:?}, skipping model conversion. Ensure .venv exists if you need to convert models.", python_path);
+    let python_in_path = python_path.components().count() == 1;
+    if !python_in_path && !python_path.exists() {
+        println!(
+            "cargo:warning=Python interpreter not found at {}, skipping model conversion.",
+            python_path.display()
+        );
         return;
     }
 
@@ -101,23 +111,22 @@ fn convert_models(manifest_dir: &str) {
 
         if !src_path.exists() {
             println!(
-                "cargo:warning=Source model not found at {:?}, skipping conversion.",
-                src_path
+                "cargo:warning=Source model not found at {}, skipping conversion.",
+                src_path.display()
             );
             continue;
         }
 
-        // Check if we need to convert (dst doesn't exist or src is newer)
-        let should_convert = if !dst_path.exists() {
-            true
-        } else {
+        let should_convert = if dst_path.exists() {
             let src_meta = fs::metadata(&src_path).unwrap();
             let dst_meta = fs::metadata(&dst_path).unwrap();
             src_meta.modified().unwrap() > dst_meta.modified().unwrap()
+        } else {
+            true
         };
 
         if should_convert {
-            println!("Converting {} to ORT format...", src_name);
+            println!("Converting {src_name} to ORT format...");
             let status = std::process::Command::new(&python_path)
                 .args([
                     "-m",
@@ -126,21 +135,12 @@ fn convert_models(manifest_dir: &str) {
                     "--output_dir",
                     out_dir.to_str().unwrap(),
                     "--optimization_style",
-                    "Fixed", // Use "Fixed" for pre-optimized models or "Runtime"
-                             // Note: If using "Fixed", we might want to check the specific flags.
-                             // For now, default behavior of the tool is usually sufficient.
-                             // The tool output filename might default to model.ort, we need to handle renaming if needed,
-                             // but usually it keeps the basename.
+                    "Fixed",
                 ])
                 .status()
                 .expect("Failed to run conversion command");
 
-            if !status.success() {
-                panic!("Model conversion failed for {}", src_name);
-            }
-
-            // The tool might invoke "saved to <out_dir>/gtcrn.ort"
-            // Ensure the expected output name matches
+            assert!(status.success(), "Model conversion failed for {src_name}");
         }
     }
 }
